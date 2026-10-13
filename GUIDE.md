@@ -10,7 +10,7 @@ own client (Xcode) instead of third-party login flows.
 | Thing | Minimum | Notes |
 |---|---|---|
 | Mac | anything running macOS 13.5+ (Ventura) | Intel and Apple Silicon both fine |
-| Xcode | **15+**, full app (not CLT-only) | Free from the App Store, ~7–15 GB download. Tested on 27.0; older 15.x–25.x should work but devicectl syntax varied across versions — report breakage |
+| Xcode | **15+**, full app (not CLT-only) | Free from the App Store, ~7–15 GB download. Tested on 27.0; older 15.x–26.x should work but devicectl syntax varied across versions — report breakage |
 | iPhone | iOS 17+ recommended (16 best-effort) | Beta iOS needs matching/beta Xcode, see below |
 | Apple ID | free is fine | Paid also works (fewer limits) |
 
