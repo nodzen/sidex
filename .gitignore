@@ -1,0 +1,4 @@
+work/
+build-*/
+.DS_Store
+*.xcuserdata

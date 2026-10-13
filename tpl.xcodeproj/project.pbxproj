@@ -1,0 +1,215 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		AAAAAAAA0000000000000009 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = AAAAAAAA0000000000000002 /* main.m */; };
+		AAAAAAAA0000000000000010 /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = AAAAAAAA0000000000000004 /* AppDelegate.m */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		AAAAAAAA0000000000000001 /* StubApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = StubApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AAAAAAAA0000000000000002 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
+		AAAAAAAA0000000000000003 /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
+		AAAAAAAA0000000000000004 /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
+		AAAAAAAA0000000000000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		AAAAAAAA0000000000000006 /* StubApp */ = {
+			isa = PBXGroup;
+			children = (
+				AAAAAAAA0000000000000002 /* main.m */,
+				AAAAAAAA0000000000000003 /* AppDelegate.h */,
+				AAAAAAAA0000000000000004 /* AppDelegate.m */,
+				AAAAAAAA0000000000000005 /* Info.plist */,
+			);
+			path = StubApp;
+			sourceTree = "<group>";
+		};
+		AAAAAAAA0000000000000015 = {
+			isa = PBXGroup;
+			children = (
+				AAAAAAAA0000000000000006 /* StubApp */,
+				AAAAAAAA0000000000000016 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		AAAAAAAA0000000000000016 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				AAAAAAAA0000000000000001 /* StubApp.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		AAAAAAAA0000000000000011 /* StubApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AAAAAAAA0000000000000014 /* Build configuration list for PBXNativeTarget "StubApp" */;
+			buildPhases = (
+				AAAAAAAA0000000000000007 /* Sources */,
+				AAAAAAAA0000000000000008 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = StubApp;
+			productName = StubApp;
+			productReference = AAAAAAAA0000000000000001 /* StubApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AAAAAAAA0000000000000012 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastUpgradeCheck = 1700;
+			};
+			buildConfigurationList = AAAAAAAA0000000000000013 /* Build configuration list for PBXProject "StubApp" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+			);
+			mainGroup = AAAAAAAA0000000000000015;
+			productRefGroup = AAAAAAAA0000000000000016 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				AAAAAAAA0000000000000011 /* StubApp */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		AAAAAAAA0000000000000008 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		AAAAAAAA0000000000000007 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AAAAAAAA0000000000000009 /* main.m in Sources */,
+				AAAAAAAA0000000000000010 /* AppDelegate.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		AAAAAAAA0000000000000017 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				ONLY_ACTIVE_ARCH = YES;
+			};
+			name = Debug;
+		};
+		AAAAAAAA0000000000000018 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				GCC_OPTIMIZATION_LEVEL = s;
+			};
+			name = Release;
+		};
+		AAAAAAAA0000000000000019 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = __TEAM__;
+				INFOPLIST_FILE = StubApp/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					UIKit,
+					"-framework",
+					Foundation,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.stub;
+				PRODUCT_NAME = StubApp;
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		AAAAAAAA0000000000000020 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = __TEAM__;
+				INFOPLIST_FILE = StubApp/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					UIKit,
+					"-framework",
+					Foundation,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.stub;
+				PRODUCT_NAME = StubApp;
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		AAAAAAAA0000000000000013 /* Build configuration list for PBXProject "StubApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AAAAAAAA0000000000000017 /* Debug */,
+				AAAAAAAA0000000000000018 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		AAAAAAAA0000000000000014 /* Build configuration list for PBXNativeTarget "StubApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AAAAAAAA0000000000000019 /* Debug */,
+				AAAAAAAA0000000000000020 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = AAAAAAAA0000000000000012 /* Project object */;
+}
