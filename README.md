@@ -1,11 +1,13 @@
-# free-sideload
+# sidex
 
 Install any `.ipa` on your iPhone with a **free Apple ID** — using only Xcode. No third-party servers, no Anisette, no accounts on shady signing services.
 
 ```bash
-/bin/bash free-sideload.sh /path/to/app.ipa
+/bin/bash sidex /path/to/app.ipa
 # or run it with no args, then drag & drop the .ipa into the terminal
 ```
+
+New here? Read **[GUIDE.md](GUIDE.md)** — versions, setup, troubleshooting.
 
 ## Requirements
 
@@ -25,7 +27,7 @@ Takes ~5 minutes. Re-run the same command to refresh.
 
 ## Flags
 
-- `--keep-watch` — keep the Watch app inside the IPA (removed by default: free accounts cannot sign it and it breaks installation).
+- `--keep-watch` — keep the Apple Watch app inside the IPA (removed by default: free accounts cannot sign it and it breaks installation).
 
 ## Honest limits (free Apple ID, Apple's rules)
 
