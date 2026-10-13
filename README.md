@@ -30,6 +30,10 @@ Mode, troubleshooting).
 - iPhone connected (USB or same Wi-Fi), Trust tapped, unlocked
 - Nothing else. No Homebrew packages, no Python modules, no paid account.
 
+> Tested on Xcode 27.0 + iOS 27.2. The gate is Xcode 15+ (`devicectl` era), but
+> older devicectl syntax may differ — if it breaks on your version, the error
+> will be visible (install just won't run), please report it as an issue.
+
 ## How it works
 
 1. Finds your iPhone and your Team ID — nothing to look up by hand.
