@@ -19,7 +19,8 @@ cd sidex
 /bin/bash sidex /path/to/app.ipa
 ```
 
-No arguments? It asks — you can **drag & drop** the `.ipa` into the terminal.
+No arguments? You get a menu — install an app, export a certificate or push a
+pairing file. For install you can **drag & drop** the `.ipa` into the terminal.
 
 New to this? Follow **[GUIDE.md](GUIDE.md)** step by step (Xcode setup, Developer
 Mode, troubleshooting).
@@ -28,7 +29,9 @@ Mode, troubleshooting).
 
 - macOS + full **Xcode 15+** with your Apple ID logged in (`Xcode → Settings → Accounts`)
 - iPhone connected (USB or same Wi-Fi), Trust tapped, unlocked
-- Nothing else. No Homebrew packages, no Python modules, no paid account.
+- Nothing else. No Homebrew packages, no Python, no paid account — sidex
+  compiles its own tiny native helper with Xcode's `swiftc` on first use
+  (a few seconds, then cached in `~/Library/Caches/sidex`).
 
 > Tested on Xcode 27.0 + iOS 27.2. The gate is Xcode 15+ (`devicectl` era), but
 > older devicectl syntax may differ — if it breaks on your version, the error
@@ -36,11 +39,14 @@ Mode, troubleshooting).
 
 ## How it works
 
-1. Finds your iPhone and your Team ID — nothing to look up by hand.
+1. Finds your iPhone (asks which one if several are connected) and your Team ID
+   — nothing to look up by hand.
 2. Reads the IPA and decides bundle IDs (updates the installed app in place when
    found, preserving data).
 3. Builds a tiny stub project a few times so Xcode mints a development
-   certificate + provisioning profiles for every bundle (app + extensions).
+   certificate + provisioning profiles for every bundle (app + extensions), and
+   registers your device with Apple automatically (manual Xcode run is a
+   fallback).
 4. Re-signs everything: bundle IDs namespaced to your team, entitlements
    mirrored from the profiles, frameworks and extensions signed inside-out.
 5. Installs via `devicectl` and launches the app. Prints the profile expiry date.
@@ -51,6 +57,22 @@ Takes ~5 minutes. Re-run the same command to refresh.
 
 - `--keep-watch` — keep the Apple Watch app inside the IPA (removed by default:
   free accounts cannot sign it and it breaks installation).
+- `sidex pair [--to NAME|BUNDLE] [--out FILE] [--save-only]` — get the
+  lockdown pairing record and push it into the app's Documents via `devicectl`
+  (SideStore/LiveContainer/StikDebug pick it up from there; without `--to`
+  you choose from apps found **on the device**). Asks usbmuxd first (no sudo,
+  no permissions needed; the iPhone needs the USB cable here). On a fresh Mac
+  with no record at all it runs the same **ProtocolVersion 2 Pair
+  handshake Xcode uses** and pairs with the iPhone itself (unlock the phone,
+  tap Trust). `/var/db/lockdown` with sudo + Full Disk Access remains the
+  last fallback. Lockdown only; RPPairing still needs `idevice_pair`.
+- `sidex cert [--password PW] [--out FILE] [--push-to NAME|BUNDLE]` — export
+  the Apple Development identity as `.p12` for LiveContainer → Settings →
+  Import Certificate (JIT-less mode).
+- `sidex devices` — list connected iPhones/iPads. `sidex apps` — list what is
+  installed and how many apps count against your free-account limit (~3).
+- `SIDEX_TEAM=XXXXXXXXXX sidex …` — skip Team ID auto-detection when several
+  Apple IDs are in Xcode.
 
 ## Honest limits (free Apple ID, Apple's rules — same for every free signer)
 

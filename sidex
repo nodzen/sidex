@@ -1,16 +1,400 @@
 #!/bin/bash
 # sidex <app.ipa> — install IPA with a free Apple ID, no servers.
 # Requires: macOS + Xcode with logged-in Apple ID + iPhone on USB or Wi-Fi.
-# Usage: /bin/bash sidex /path/to/app.ipa
+# Usage: /bin/bash sidex /path/to/app.ipa   (no arguments -> interactive menu)
 set -u
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DEVICECTL=/usr/bin/xcrun
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 fail() { echo "ERROR: $*" >&2; exit "${2:-1}"; }
 info() { echo "==> $*"; }
 
+# --- native helper: everything bash cannot do comfortably (plist socket protocols,
+# --- TLS, certificate surgery, devicectl JSON) lives in sidex-helper.swift. It is
+# --- compiled once with Xcode's own swiftc and cached — no Python, no Homebrew.
+HELPER=""
+ensure_helper() {
+  [ -n "$HELPER" ] && [ -x "$HELPER" ] && return 0
+  local SRC="$SCRIPT_DIR/sidex-helper.swift" DIR LOG BIN
+  DIR="${XDG_CACHE_HOME:-$HOME/Library/Caches}/sidex"
+  mkdir -p "$DIR" 2>/dev/null || DIR="${TMPDIR:-/tmp}/sidex-${USER:-user}"
+  mkdir -p "$DIR" || fail "Cannot create cache directory: $DIR"
+  LOG="$DIR/build.log"
+  BIN="$DIR/helper-$(shasum -a 256 "$SRC" | cut -c1-12)"   # hash = rebuilds when the source changes
+  if [ ! -x "$BIN" ]; then
+    echo "==> Compiling the sidex helper (one time, a few seconds)..." >&2
+    xcrun -f swiftc >/dev/null 2>&1 || fail "swiftc not found. Install full Xcode (Xcode -> Settings -> Locations)."
+    xcrun swiftc -o "$BIN.new.$$" "$SRC" 2>"$LOG" || { tail -20 "$LOG" >&2; fail "Helper compilation failed (full log: $LOG)"; }
+    mv "$BIN.new.$$" "$BIN" || fail "Cannot install the helper into $DIR"
+  fi
+  HELPER="$BIN"
+}
+
+# prompts answer on stderr, so a function's result on stdout stays clean
+ask() { # $1=prompt $2=default -> REPLY
+  local D="${2:-}"
+  while :; do
+    printf '%s' "$1" >&2
+    [ -n "$D" ] && printf ' [%s]' "$D" >&2
+    printf ': ' >&2
+    IFS= read -r REPLY || { echo >&2; fail "No input (terminal closed?)"; }
+    [ -n "$REPLY" ] || REPLY="$D"
+    [ -n "$REPLY" ] && return 0
+    echo "  Type something, please." >&2
+  done
+}
+
+confirm() { # $1=question -> 0=yes
+  local R
+  printf '%s [y/N]: ' "$1" >&2
+  IFS= read -r R || return 1
+  case "$R" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+usage() {
+  echo "usage:"
+  echo "  sidex                                                     interactive menu"
+  echo "  sidex <app.ipa> [--keep-watch]                            install / refresh app"
+  echo "  sidex pair [--to NAME|BUNDLE] [--out FILE] [--save-only]  lockdown pairing file, optionally push into app"
+  echo "  sidex cert [--password PW] [--out FILE] [--push-to NAME|BUNDLE]"
+  echo "                                                            export dev identity as .p12 (LiveContainer JIT-less)"
+  echo "  sidex devices                                             list connected iPhones/iPads"
+  echo "  sidex apps                                                list apps installed on the device"
+  echo ""
+  echo "env: SIDEX_TEAM=XXXXXXXXXX  skip Team ID detection (multiple Apple IDs)"
+}
+
+# --- devices: everything is read from the device via devicectl ---
+
+devices_json() {
+  if [ -n "${SIDEX_DEVICES_JSON:-}" ]; then cat "$SIDEX_DEVICES_JSON"   # ponytail: test hook, see tests/smoke.sh
+  else xcrun devicectl list devices -j /dev/stdout 2>/dev/null; fi
+}
+
+# one line per real iPhone/iPad: "UDID|Name (iOS x.y, USB)"
+list_devices() {
+  ensure_helper
+  devices_json | "$HELPER" devices
+}
+
+select_device() { # sets UDID; asks when several devices are connected
+  local LIST N I=0
+  LIST="$(list_devices)"
+  [ -n "$LIST" ] || fail "No iPhone/iPad found. Connect via USB or Wi-Fi, tap Trust, make sure it is unlocked."
+  N="$(printf '%s\n' "$LIST" | grep -c . || true)"
+  if [ "$N" = 1 ]; then UDID="${LIST%%|*}"; return 0; fi
+  echo "Several devices connected:" >&2
+  while IFS='|' read -r U LBL; do
+    I=$((I+1)); echo "  $I) $LBL   $U" >&2
+  done <<< "$LIST"
+  while :; do
+    ask "Device number" 1
+    UDID="$(printf '%s\n' "$LIST" | awk -F'|' -v n="$REPLY" 'NR==n{print $1}')"
+    [ -n "$UDID" ] && return 0
+    echo "  No device $REPLY." >&2
+  done
+}
+
+# --- installed apps, also read from the device ---
+
+device_apps() { # caches the device app list in APPS_JSON for this run
+  [ -n "${APPS_JSON:-}" ] && return 0
+  if [ -n "${SIDEX_APPS_JSON:-}" ]; then APPS_JSON="$(cat "$SIDEX_APPS_JSON")"   # ponytail: test hook
+  else
+    [ -n "${UDID:-}" ] || fail "No device selected"
+    APPS_JSON="$(xcrun devicectl device info apps --device "$UDID" -j /dev/stdout 2>/dev/null)" || APPS_JSON=""
+  fi
+}
+
+# $1 = all | team | pair-targets   [$2 = team]
+# prints "Name\tBundleID\tteam|" lines; extensions of listed apps are dropped
+apps_query() {
+  ensure_helper
+  device_apps
+  printf '%s' "${APPS_JSON:-}" | "$HELPER" apps "$1" "${2:-}"
+}
+
+# $1 = bundle id or (part of) display name -> prints bundle id
+resolve_bundle() {
+  local q="$1" L
+  case "$q" in *.*) echo "$q"; return 0;; esac
+  L="$(apps_query all)" || true
+  printf '%s\n' "$L" | awk -F'\t' -v q="$q" '
+    BEGIN { ql = tolower(q); exact = ""; n = 0 }
+    NF >= 2 {
+      nm = tolower($1); bd = tolower($2)
+      if (nm == ql && exact == "") exact = $2
+      if (index(nm, ql) > 0 || index(bd, ql) > 0) { n++; sub2[n] = $2; name2[n] = $1 }
+    }
+    END {
+      if (exact != "") { print exact; exit 0 }
+      if (n == 1) { print sub2[1]; exit 0 }
+      if (n > 1) {
+        printf "Multiple matches:\n" > "/dev/stderr"
+        for (i = 1; i <= n; i++) printf "  %s  %s\n", name2[i], sub2[i] > "/dev/stderr"
+        exit 1
+      }
+      exit 2
+    }' || fail "No single installed app matches '$q'"
+}
+
+# interactive target chooser: prints the chosen bundle id on stdout, rc=1 if skipped
+pick_app() {
+  local LIST I=0 NM B MK ANS
+  LIST="$(apps_query pair-targets)"
+  if [ -n "$LIST" ]; then
+    echo "Target app on the iPhone:" >&2
+    while IFS=$'\t' read -r NM B MK; do
+      [ -n "$B" ] || continue
+      I=$((I+1)); echo "  $I) $NM  ($B)" >&2
+    done <<< "$LIST"
+  else
+    echo "No SideStore / LiveContainer / StikDebug found on the device." >&2
+  fi
+  while :; do
+    printf 'App number, name or Bundle ID (Enter to skip): ' >&2
+    IFS= read -r ANS || return 1
+    [ -n "$ANS" ] || return 1
+    case "$ANS" in
+      *[!0-9]*) ;;   # not a number: try it as a name / bundle id
+      *)
+        if [ "$ANS" -ge 1 ] && [ "$ANS" -le "$I" ]; then
+          printf '%s\n' "$LIST" | awk -F'\t' -v n="$ANS" 'NR==n{print $2}'
+          return 0
+        fi
+        echo "  No app $ANS." >&2
+        continue ;;
+    esac
+    if B="$(resolve_bundle "$ANS")"; then echo "$B"; return 0; fi
+    echo "  Try again, or Enter to skip." >&2
+  done
+}
+
+detect_team() {
+  TEAM=""
+  if [ -n "${SIDEX_TEAM:-}" ]; then
+    TEAM="$SIDEX_TEAM"
+  else
+    CAND="$(ls ~/Library/Developer/Xcode/UserData/Capabilities/ 2>/dev/null | sed -n 's/.*-\([A-Z0-9]\{10\}\)-bundle\.json/\1/p' | head -1)"
+    [ -n "$CAND" ] && TEAM="$CAND"
+    if [ -z "$TEAM" ]; then
+      TEAM="$(for C in $(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*CN=//p'); do
+        security find-certificate -c "$C" -p 2>/dev/null | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*OU=\([A-Z0-9]\{10\}\).*/\1/p'
+      done | head -1)"
+    fi
+    if [ -z "$TEAM" ] && [ -n "${UDID:-}" ]; then
+      ensure_helper
+      TEAM="$(xcrun devicectl device info apps --device "$UDID" -j /dev/stdout 2>/dev/null | "$HELPER" team-id)"
+    fi
+    if [ -z "$TEAM" ]; then
+      echo "Could not detect Team ID automatically." >&2
+      echo "Open developer.apple.com/account -> Membership -> Team ID (10 characters)" >&2
+      while :; do
+        ask "Paste Team ID"
+        echo "$REPLY" | grep -qE '^[A-Z0-9]{10}$' && { TEAM="$REPLY"; break; }
+        echo "  That is not a 10-character Team ID." >&2
+      done
+    fi
+  fi
+  echo "$TEAM" | grep -qE '^[A-Z0-9]{10}$' || fail "Does not look like a Team ID: $TEAM"
+}
+
+find_cert() { # needs TEAM set
+  CERT="$(security find-identity -v -p codesigning 2>/dev/null | grep "Apple Development" | while IFS= read -r L; do
+    N="$(echo "$L" | sed -n 's/.*"\(Apple Development[^"]*\)".*/\1/p')"
+    [ -z "$N" ] && continue
+    OU="$(security find-certificate -c "$N" -p 2>/dev/null | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*OU=\([A-Z0-9]\{10\}\).*/\1/p')"
+    [ "$OU" = "$TEAM" ] && { echo "$N"; break; }
+  done)"
+  [ -n "$CERT" ] || fail "No Apple Development certificate for $TEAM"
+}
+
+# --- pairing file / certificate push ---
+
+# remote path inside app Documents, mirrors idevice_pair known apps table
+remote_pair_name() { # $1=bundle
+  case "$(echo "$1" | tr 'A-Z' 'a-z')" in
+    *livecontainer*) echo "SideStore/Documents/ALTPairingFile.mobiledevicepairing" ;;
+    *stikdebug*|*feather*|*ksign*|*sparsebox*|*protok*|*antrag*|*enswilde*|*reynard*|*stosdebug*) echo "pairingFile.plist" ;;
+    *) echo "ALTPairingFile.mobiledevicepairing" ;;
+  esac
+}
+
+# Ask the usbmuxd daemon for the stored pairing record (same approach as idevice_pair):
+# no sudo, no Full Disk Access. Works while the iPhone is visible to usbmuxd
+# (USB cable; Apple's usbmuxd does not list Wi-Fi devices).
+pair_record_usbmuxd() { # $1=UDID $2=out file
+  ensure_helper
+  "$HELPER" fetch-record "$1" "$2"
+}
+
+# Full pairing from scratch (no record anywhere): the same "ProtocolVersion 2" Pair
+# handshake Xcode uses when a fresh iPhone shows its Trust dialog. Needs the iPhone
+# unlocked; system swiftc-built helper + /usr/bin/openssl only, no sudo, no Full Disk Access.
+pair_record_live() { # $1=UDID $2=out file
+  ensure_helper
+  "$HELPER" pair "$1" "$2"
+}
+
+# $1=local file $2=bundle $3=remote path inside Documents
+push_to_app() {
+  local R
+  R="$(xcrun devicectl device copy to --device "$UDID" --source "$1" \
+    --destination "Documents/$3" --domain-type appDataContainer \
+    --domain-identifier "$2" 2>&1)" || { echo "$R" | tail -3 >&2; fail "Failed to push into $2/Documents/$3"; }
+}
+
+cmd_pair() {
+  local TO="" OUT="" SAVE_ONLY=0 BUNDLE="" R
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) TO="${2:-}"; shift 2 ;;
+      --to=*) TO="${1#--to=}"; shift ;;
+      --out) OUT="${2:-}"; shift 2 ;;
+      --out=*) OUT="${1#--out=}"; shift ;;
+      --save-only) SAVE_ONLY=1; shift ;;
+      *) fail "Unknown option for pair: $1 (usage: sidex pair [--to NAME|BUNDLE] [--out FILE] [--save-only])" ;;
+    esac
+  done
+  select_device; info "Device: $UDID"
+  [ -n "$OUT" ] || OUT="$PWD/ALTPairingFile.mobiledevicepairing"
+  info "Asking usbmuxd for the pairing record (no sudo, no Full Disk Access needed)..."
+  if pair_record_usbmuxd "$UDID" "$OUT"; then
+    chmod 600 "$OUT" 2>/dev/null || true
+    info "Pairing file: $OUT (via usbmuxd)"
+  elif info "No stored record - pairing with the iPhone now (works on a fresh Mac)..." \
+    && pair_record_live "$UDID" "$OUT"; then
+    chmod 600 "$OUT" 2>/dev/null || true
+    info "Pairing file: $OUT (paired just now)"
+  else
+    info "Falling back to /var/db/lockdown (needs sudo + Full Disk Access)..."
+    if ! R="$(sudo cp "/var/db/lockdown/$UDID.plist" "$OUT" 2>&1)"; then
+      if echo "$R" | grep -q "Operation not permitted"; then
+        echo "macOS blocks /var/db/lockdown for apps without Full Disk Access — and sudo does NOT bypass it." >&2
+        echo "Fix: System Settings -> Privacy & Security -> Full Disk Access -> enable ${TERM_PROGRAM:-your terminal app}," >&2
+        echo "     then fully quit that app (Cmd+Q), reopen and re-run. Shortcut to open the pane:" >&2
+        echo "     open \"x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles\"" >&2
+        fail "Pairing file not saved: terminal app lacks Full Disk Access"
+      fi
+      fail "No lockdown record for $UDID (connect via USB, tap Trust, keep unlocked, retry)"
+    fi
+    chmod 600 "$OUT" 2>/dev/null || true
+    info "Pairing file: $OUT"
+  fi
+  [ "$SAVE_ONLY" = 1 ] && return 0
+  if [ -n "$TO" ]; then BUNDLE="$(resolve_bundle "$TO")"
+  else BUNDLE="$(pick_app)" || BUNDLE=""
+  fi
+  if [ -z "$BUNDLE" ]; then
+    echo "Nothing pushed. Later: sidex pair --to <Name|BundleID>"
+    return 0
+  fi
+  RP="$(remote_pair_name "$BUNDLE")"
+  push_to_app "$OUT" "$BUNDLE" "$RP"
+  info "Pushed to $BUNDLE/Documents/$RP"
+  info "Open the app on iPhone — it should stop asking for a pairing file."
+}
+
+cmd_cert() {
+  local PW="" OUT="" PUSH_TO="" BUNDLE=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --password) PW="${2:-}"; shift 2 ;;
+      --password=*) PW="${1#--password=}"; shift ;;
+      --out) OUT="${2:-}"; shift 2 ;;
+      --out=*) OUT="${1#--out=}"; shift ;;
+      --push-to) PUSH_TO="${2:-}"; shift 2 ;;
+      --push-to=*) PUSH_TO="${1#--push-to=}"; shift ;;
+      *) fail "Unknown option for cert: $1 (usage: sidex cert [--password PW] [--out FILE] [--push-to NAME|BUNDLE])" ;;
+    esac
+  done
+  detect_team; info "Team: $TEAM"
+  find_cert; info "Certificate: $CERT"
+  [ -n "$OUT" ] || OUT="$PWD/AppleDevelopment-$TEAM.p12"
+  [ -n "$PW" ] || PW="$(openssl rand -hex 6)"
+  KC="$(security default-keychain 2>/dev/null | tr -d ' "')"
+  [ -n "$KC" ] || KC="$HOME/Library/Keychains/login.keychain-db"
+  R="$(security export -k "$KC" -t identities -f pkcs12 -o "$OUT" -P "$PW" 2>&1)" \
+    || { echo "$R" | tail -2 >&2; fail "Failed to export identities from $KC"; }
+  # verify with Apple's own parser (openssl can't read Apple's legacy PBE): round-trip through a throwaway keychain
+  VD="$(mktemp -d)"; VK="$VD/v.keychain-db"
+  security create-keychain -p "$(openssl rand -hex 8)" "$VK" >/dev/null \
+    && security import "$OUT" -k "$VK" -P "$PW" -A >/dev/null 2>&1 \
+    && SUBJ="$(security find-certificate -a -p "$VK" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null)"
+  security delete-keychain "$VK" >/dev/null 2>&1
+  rm -rf "$VD"
+  [ -n "${SUBJ:-}" ] || fail "Exported file failed verification (bad .p12)"
+  echo "$SUBJ" | grep -q "OU=$TEAM" || fail "Exported .p12 is not for team $TEAM: $SUBJ"
+  # ponytail: exports every identity in the keychain, fine while it holds one dev identity; isolate via temp keychain if that ever matters
+  NCERTS="$(security find-identity -v -p codesigning 2>/dev/null | grep -c "Apple Development" || true)"
+  [ "${NCERTS:-1}" -gt 1 ] 2>/dev/null && info "Note: $NCERTS dev identities exported, yours is first. Split the .p12 if LiveContainer picks the wrong one."
+  info "Certificate file: $OUT"
+  info "Password: $PW  (LiveContainer will ask for it on import)"
+  if [ -n "$PUSH_TO" ]; then
+    select_device; info "Device: $UDID"
+    BUNDLE="$(resolve_bundle "$PUSH_TO")"
+    push_to_app "$OUT" "$BUNDLE" "sidex-cert.p12"
+    info "Pushed to $BUNDLE/Documents/sidex-cert.p12"
+  elif [ -t 0 ] && confirm "Push the .p12 to an app on the iPhone now?"; then
+    select_device; info "Device: $UDID"
+    BUNDLE="$(pick_app)" || BUNDLE=""
+    if [ -n "$BUNDLE" ]; then
+      push_to_app "$OUT" "$BUNDLE" "sidex-cert.p12"
+      info "Pushed to $BUNDLE/Documents/sidex-cert.p12"
+    else
+      echo "Not pushed. Later: sidex cert --push-to <Name|BundleID>"
+    fi
+  else
+    echo "Get the file into Files on iPhone (AirDrop / Finder File Sharing), then LiveContainer -> Settings -> Import Certificate -> pick it -> enter the password."
+  fi
+}
+
+cmd_devices() {
+  local L
+  L="$(list_devices)"
+  [ -n "$L" ] || fail "No iPhone/iPad found. Connect via USB or Wi-Fi, tap Trust, make sure it is unlocked."
+  printf '%s\n' "$L" | awk -F'|' '{printf "  %-30s %s\n", $2, $1}'
+}
+
+cmd_apps() {
+  select_device; info "Device: $UDID"
+  detect_team; info "Team: $TEAM"
+  local LIST TC
+  LIST="$(apps_query all "$TEAM")"
+  printf '%s\n' "$LIST" | awk -F'\t' 'NF>1{printf "  %-30s %s%s\n", substr($1,1,30), $2, ($3=="team" ? "  [your team]" : "")}'
+  TC="$(printf '%s\n' "$LIST" | awk -F'\t' '$3=="team"{n++} END{print n+0}')"
+  info "Signed with your team: ${TC:-0} — a free Apple ID keeps ~3 sideloaded apps at once"
+}
+
+# --- when sourced (tests/smoke.sh) only the functions above get defined ---
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
+
+if [ $# -gt 0 ] && [ ! -f "$1" ]; then
+  case "$1" in
+    pair) shift; cmd_pair "$@"; exit $? ;;
+    cert) shift; cmd_cert "$@"; exit $? ;;
+    devices) cmd_devices; exit $? ;;
+    apps) cmd_apps; exit $? ;;
+    help|--help|-h) usage; exit 0 ;;
+  esac
+fi
+
 if [ $# -eq 0 ]; then
-  echo "Please specify the .ipa path (relative or absolute) — or drag & drop the .ipa file into this window and press Enter."
+  echo "sidex — install IPAs with a free Apple ID (no servers)"
+  echo
+  echo "  1) Install / refresh an app (.ipa)"
+  echo "  2) Export certificate (.p12 for LiveContainer)"
+  echo "  3) Pair device (pairing file for SideStore / LiveContainer / StikDebug)"
+  echo "  q) Quit"
+  ask "What to do" 1
+  case "$REPLY" in
+    1) : ;;
+    2|cert) cmd_cert; exit $? ;;
+    3|pair) cmd_pair; exit $? ;;
+    q|Q|quit|exit) exit 0 ;;
+    *) fail "Unknown choice: $REPLY" ;;
+  esac
+  echo
+  echo "Drag & drop the .ipa file into this window and press Enter."
   printf "IPA path: "; IFS= read -r IPA_IN || exit 2
   IPA="$(echo "$IPA_IN" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//")"
   IPA="${IPA//\\ / }"
@@ -32,66 +416,24 @@ done
 command -v xcodebuild >/dev/null 2>&1 || fail "Xcode not found (full Xcode required, CLT is not enough)"
 XV="$(xcodebuild -version 2>/dev/null | head -1 | sed -n 's/^Xcode \([0-9][0-9]*\).*/\1/p')"
 [ "${XV:-0}" -ge 15 ] 2>/dev/null || fail "Xcode 15+ required (devicectl era). Found: $(xcodebuild -version 2>/dev/null | head -1)"
-command -v python3 >/dev/null 2>&1 || fail "python3 not found"
+ensure_helper
 
-# --- 1. device: first physical one (8-16 UDID; simulators have UUIDs) ---
-UDID="$(xcrun devicectl list devices -j /dev/stdout 2>/dev/null | python3 -c "
-import json,sys,re
-try:
-  d=json.load(sys.stdin)
-  for dev in d['result']['devices']:
-    p=dev.get('properties',{})
-    u=dev.get('udid') or p.get('hardware',{}).get('udid','')
-    if re.match(r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}\$', u or ''):
-      print(u); break
-except Exception:
-  pass
-")"
-[ -n "$UDID" ] || fail "No iPhone found. Connect via USB or Wi-Fi, tap Trust, make sure it is unlocked."
+# --- 1. device: physical iPhones/iPads only; menu if more than one ---
+select_device
 info "Device: $UDID"
 
-# --- 2. Team ID: Capabilities -> keychain -> installed-apps heuristic ---
-TEAM=""
-CAND="$(ls ~/Library/Developer/Xcode/UserData/Capabilities/ 2>/dev/null | sed -n 's/.*-\([A-Z0-9]\{10\}\)-bundle\.json/\1/p' | head -1)"
-[ -n "$CAND" ] && TEAM="$CAND"
-if [ -z "$TEAM" ]; then
-  TEAM="$(for C in $(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*CN=//p'); do
-    security find-certificate -c "$C" -p 2>/dev/null | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*OU=\([A-Z0-9]\{10\}\).*/\1/p'
-  done | head -1)"
-fi
-if [ -z "$TEAM" ]; then
-  TEAM="$(xcrun devicectl device info apps --device "$UDID" -j /dev/stdout 2>/dev/null | python3 -c "
-import json,sys,re
-try:
-  d=json.load(sys.stdin)
-  def walk(o):
-    if isinstance(o,dict):
-      b=o.get('bundleIdentifier','')
-      m=re.search(r'\.([A-Z0-9]{10})(\.|$)',b)
-      if m: print(m.group(1)); raise StopIteration
-      for v in o.values(): walk(v)
-    elif isinstance(o,list):
-      for v in o: walk(v)
-  walk(d)
-except StopIteration:
-  pass
-except Exception:
-  pass
-")"
-fi
-if [ -z "$TEAM" ]; then
-  echo "Could not detect Team ID automatically."
-  echo "Open developer.apple.com/account -> Membership -> Team ID (10 characters)"
-  printf "Paste Team ID: "; read -r TEAM
-fi
-echo "$TEAM" | grep -qE '^[A-Z0-9]{10}$' || fail "Does not look like a Team ID: $TEAM"
+# --- 2. Team ID: env -> Capabilities -> keychain -> installed-apps heuristic -> ask ---
+detect_team
 info "Team: $TEAM"
 
 # --- 3. unzip IPA, read bundle ids ---
 WORK="$SCRIPT_DIR/work"; rm -rf "$WORK"; mkdir -p "$WORK"
 unzip -q "$IPA" -d "$WORK" || fail "Failed to unzip IPA"
-APP_DIR="$(echo "$WORK"/Payload/*.app)"
-[ -d "$APP_DIR" ] || fail "No .app inside Payload"
+APP_DIR=""
+for CAND in "$WORK"/Payload/*.app; do
+  if [ -d "$CAND" ]; then APP_DIR="$CAND"; break; fi
+done
+[ -n "$APP_DIR" ] || fail "No .app inside Payload"
 if [ "$STRIP_WATCH" = 1 ]; then
   for W in "$APP_DIR/Watch" "$APP_DIR/com.apple.WatchPlaceholder"; do
     if [ -e "$W" ]; then rm -rf "$W"; info "Removed Watch app (free accounts cannot sign it): $(basename "$W")"; fi
@@ -103,26 +445,22 @@ info "App: $APP_BID"
 
 # target app id: reuse the installed one if present, else orig.TEAM
 INSTALLED=""; for TRY in 1 2 3; do
-  INSTALLED="$(xcrun devicectl device info apps --device "$UDID" -j /dev/stdout 2>/dev/null | python3 -c "
-import json,sys
-want=sys.argv[1]
-try:
-  d=json.load(sys.stdin)
-  found=[]
-  def walk(o):
-    if isinstance(o,dict):
-      b=o.get('bundleIdentifier','')
-      if b==want or b.startswith(want+'.'): found.append(b)
-      for v in o.values(): walk(v)
-    elif isinstance(o,list):
-      for v in o: walk(v)
-  walk(d)
-  print(found[0] if found else '')
-except Exception:
-  pass
-" "$APP_BID")"; [ -n "$INSTALLED" ] && break; sleep 2; done
+  INSTALLED="$(xcrun devicectl device info apps --device "$UDID" -j /dev/stdout 2>/dev/null | "$HELPER" installed-bundle "$APP_BID")"; [ -n "$INSTALLED" ] && break; sleep 2; done
 if [ -n "$INSTALLED" ]; then APP_NEW="$INSTALLED"; info "Already installed, updating: $APP_NEW (data will be kept)";
 else APP_NEW="$APP_BID.$TEAM"; info "New ID: $APP_NEW"; fi
+
+# free Apple ID keeps ~3 sideloaded apps at once; warn before the 5-minute mint
+if [ -z "$INSTALLED" ]; then
+  TALIST="$(apps_query team "$TEAM")"
+  TAN="$(printf '%s\n' "$TALIST" | grep -c . || true)"
+  if [ "${TAN:-0}" -ge 3 ]; then
+    echo "  Note: a free Apple ID keeps ~3 sideloaded apps at once. Already signed with $TEAM ($TAN):"
+    printf '%s\n' "$TALIST" | while IFS=$'\t' read -r NM B MK; do
+      [ -n "$B" ] && echo "    - $NM  ($B)"
+    done
+    echo "  iOS will likely refuse this one — delete an app on the iPhone first."
+  fi
+fi
 
 # extensions: app_new + last component of the original
 APPEX_LIST=""
@@ -133,94 +471,74 @@ for A in "$APP_DIR"/PlugIns/*.appex; do
   APPEX_LIST="$APPEX_LIST
 $(basename "$A" .appex)|$OB|$APP_NEW.$SHORT"
 done
-if [ -n "$APPEX_LIST" ]; then echo "$APPEX_LIST" | sed 's/^/  appex: /'; fi
+if [ -n "$APPEX_LIST" ]; then printf '%s\n' "$APPEX_LIST" | sed -n '/./s/^/  appex: /p'; fi
 
-# --- 4. stub project to mint profiles ---
+# --- 4. stub project to mint profiles (auto-registers the device too) ---
 STUB="$WORK/stub"; rm -rf "$STUB"; mkdir -p "$STUB"
 cp -r "$SCRIPT_DIR/tpl.xcodeproj" "$STUB/StubApp.xcodeproj"
 cp -r "$SCRIPT_DIR/tplsrc" "$STUB/StubApp"
 PROF="$WORK/profiles"; mkdir -p "$PROF"
 mint() { # $1=bundle $2=profile-out
   R="$(xcodebuild -project "$STUB/StubApp.xcodeproj" -target StubApp -configuration Debug \
-    -destination "id=$UDID" -allowProvisioningUpdates \
+    -destination "id=$UDID" -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
     "DEVELOPMENT_TEAM=$TEAM" "PRODUCT_BUNDLE_IDENTIFIER=$1" \
     "CONFIGURATION_BUILD_DIR=$WORK/build-tmp" build 2>&1)"
   echo "$R" | grep -q "BUILD SUCCEEDED" || {
-    echo "$R" | grep -q "no devices" && fail "Apple does not see the device in your team. Open $STUB/StubApp.xcodeproj in Xcode, select your team, destination=iPhone, press Run once, then re-run this script." 3
+    if echo "$R" | grep -qEi "no devices|not registered"; then
+      fail "Apple still does not see the device in your team. Fallback: open $STUB/StubApp.xcodeproj in Xcode, select your team, destination = your iPhone, press Run once, then re-run this script." 3
+    fi
     echo "$R" | grep -E "error:" | head -5 >&2
     fail "Failed to mint profile for $1"
   }
-  cp "$WORK/build-tmp/StubApp.app/embedded.mobileprovision" "$2"
+  cp "$WORK/build-tmp/StubApp.app/embedded.mobileprovision" "$2" || fail "No profile in build output for $1"
 }
 info "Minting profiles..."
 mint "$APP_NEW" "$PROF/app.mobileprovision" && echo "  ok app"
-echo "$APPEX_LIST" | while IFS='|' read -r DIR OB NB; do
+while IFS='|' read -r DIR OB NB; do
   [ -z "$DIR" ] && continue
   mint "$NB" "$PROF/$DIR.mobileprovision" && echo "  ok $DIR"
-done
+done < <(printf '%s\n' "$APPEX_LIST")
 
 # --- 5. cert matching this team ---
-CERT="$(security find-identity -v -p codesigning 2>/dev/null | grep "Apple Development" | while IFS= read -r L; do
-  N="$(echo "$L" | sed -n 's/.*"\(Apple Development[^"]*\)".*/\1/p')"
-  [ -z "$N" ] && continue
-  OU="$(security find-certificate -c "$N" -p 2>/dev/null | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*OU=\([A-Z0-9]\{10\}\).*/\1/p')"
-  [ "$OU" = "$TEAM" ] && { echo "$N"; break; }
-done)"
-[ -n "$CERT" ] || fail "No Apple Development certificate for $TEAM (should have been created during profile minting)"
+find_cert
 info "Certificate: $CERT"
 
 # --- 6. re-sign: bundle ids + entitlements mirrored from profiles ---
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $APP_NEW" "$APP_DIR/Info.plist"
-echo "$APPEX_LIST" | while IFS='|' read -r DIR OB NB; do
+while IFS='|' read -r DIR OB NB; do
   [ -z "$DIR" ] && continue
-  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $NB" "$APP_DIR/PlugIns/$DIR.appex/Info.plist"
-done
-TEAM="$TEAM" PROF="$PROF" APPDIR="$APP_DIR" python3 - <<'EOF'
-import subprocess, os, plistlib, re
-team = os.environ["TEAM"]; profdir = os.environ["PROF"]; appdir = os.environ["APPDIR"]
-jobs = [(appdir, "app")]
-import glob
-for a in sorted(glob.glob(appdir + "/PlugIns/*.appex")):
-    jobs.append((a, os.path.basename(a)[:-len(".appex")]))
-def cms_plist(path):
-    raw = subprocess.run(["security", "cms", "-D", "-i", path], capture_output=True).stdout
-    return plistlib.loads(raw)
-for binpath, pname in jobs:
-    prof = cms_plist(os.path.join(profdir, pname + ".mobileprovision"))
-    ent = dict(prof["Entitlements"])
-    try:
-        raw = subprocess.run(["codesign", "-d", "--entitlements", ":-", binpath],
-                             capture_output=True).stdout
-        orig = plistlib.loads(raw) if raw.lstrip().startswith(b"<?xml") else {}
-    except Exception:
-        orig = {}
-    if "keychain-access-groups" in orig:
-        ent["keychain-access-groups"] = [
-            re.sub(r"^[A-Z0-9]{10}\.", team + ".", g) for g in orig["keychain-access-groups"]]
-    with open(binpath + ".entitlements.plist", "wb") as f:
-        plistlib.dump(ent, f)
-    print("  entitlements: " + pname)
-EOF
-find "$APP_DIR" \( -name "*.framework" -o -name "*.dylib" \) | while IFS= read -r F; do
-  codesign -f -s "$CERT" "$F" >/dev/null 2>&1 || true
-done
-echo "$APPEX_LIST" | while IFS='|' read -r DIR OB NB; do
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $NB" "$APP_DIR/PlugIns/$DIR.appex/Info.plist" \
+    || fail "Failed to set bundle id for $DIR"
+done < <(printf '%s\n' "$APPEX_LIST")
+"$HELPER" entitlements "$TEAM" "$PROF" "$APP_DIR"
+NSIGN_ERR=0
+while IFS= read -r F; do
+  codesign -f -s "$CERT" "$F" >/dev/null 2>&1 || { NSIGN_ERR=$((NSIGN_ERR+1)); echo "  warn: could not sign ${F#$APP_DIR/}" >&2; }
+done < <(find "$APP_DIR" \( -name "*.framework" -o -name "*.dylib" \) -print)
+[ "$NSIGN_ERR" = 0 ] || echo "  Note: $NSIGN_ERR nested binaries kept their old signature — the install may fail" >&2
+while IFS='|' read -r DIR OB NB; do
   [ -z "$DIR" ] && continue
   B="$APP_DIR/PlugIns/$DIR.appex"
   rm -f "$B/embedded.mobileprovision"
-  cp "$PROF/$DIR.mobileprovision" "$B/embedded.mobileprovision"
-  codesign -f -s "$CERT" --entitlements "$B.entitlements.plist" "$B" || fail "Failed to sign $DIR"
-done
+  cp "$PROF/$DIR.mobileprovision" "$B/embedded.mobileprovision" || fail "Missing profile for $DIR"
+  codesign -f -s "$CERT" --entitlements "$PROF/$DIR.entitlements.plist" "$B" || fail "Failed to sign $DIR"
+done < <(printf '%s\n' "$APPEX_LIST")
 rm -f "$APP_DIR/embedded.mobileprovision"
 cp "$PROF/app.mobileprovision" "$APP_DIR/embedded.mobileprovision"
-codesign -f -s "$CERT" --entitlements "$APP_DIR.entitlements.plist" "$APP_DIR" || fail "Failed to sign the app"
+codesign -f -s "$CERT" --entitlements "$PROF/app.entitlements.plist" "$APP_DIR" || fail "Failed to sign the app"
 
 # --- 7. repack, install, launch ---
 OUT="$WORK/signed.ipa"; rm -f "$OUT"
 (cd "$WORK" && zip -qry "$OUT" Payload) || fail "Failed to repack IPA"
 info "Done: $OUT"
-xcrun devicectl device install app --device "$UDID" "$OUT" 2>&1 | tail -3
+if R="$(xcrun devicectl device install app --device "$UDID" "$OUT" 2>&1)"; then
+  echo "$R" | tail -3
+else
+  echo "$R" | tail -10 >&2
+  fail "Install failed — see the output above"
+fi
 EXP="$(security cms -D -i "$PROF/app.mobileprovision" 2>/dev/null | plutil -extract ExpirationDate raw - 2>/dev/null)"
 info "Profile valid until: $EXP — re-run the script after that"
-xcrun devicectl device process launch --device "$UDID" "$APP_NEW" 2>&1 | tail -1
+R="$(xcrun devicectl device process launch --device "$UDID" "$APP_NEW" 2>&1)" || true
+echo "$R" | tail -1
 info "All done."

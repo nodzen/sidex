@@ -2,3 +2,7 @@ work/
 build-*/
 .DS_Store
 *.xcuserdata
+*.p12
+*.mobiledevicepairing
+__pycache__/
+LOCAL_NOTES.md

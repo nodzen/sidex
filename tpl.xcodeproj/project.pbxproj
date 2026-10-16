@@ -151,7 +151,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = __TEAM__;
 				INFOPLIST_FILE = StubApp/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				OTHER_LDFLAGS = (
 					"-framework",
 					UIKit,
@@ -173,7 +173,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = __TEAM__;
 				INFOPLIST_FILE = StubApp/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				OTHER_LDFLAGS = (
 					"-framework",
 					UIKit,
