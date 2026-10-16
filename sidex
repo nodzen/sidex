@@ -1,18 +1,14 @@
 #!/bin/bash
-# sidex <app.ipa> — install IPA with a free Apple ID, no servers.
-# Needs macOS + Xcode (logged-in Apple ID) + iPhone on USB/Wi-Fi.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 fail() { echo "ERROR: $*" >&2; exit "${2:-1}"; }
 info() { echo "==> $*"; }
 
-# --- native helper (plist/TLS/certs/devicectl JSON): compiled once with swiftc, cached.
 HELPER=""
 ensure_helper() {
   [ -n "$HELPER" ] && [ -x "$HELPER" ] && return 0
   local SRC="$SCRIPT_DIR/sidex-helper.swift" DIR LOG BIN
-  # the binary lives next to the repo (gitignored), never in the system; one copy only
   DIR="$SCRIPT_DIR/helper-cache"
   mkdir -p "$DIR" 2>/dev/null || DIR="${TMPDIR:-/tmp}/sidex-${USER:-user}"
   mkdir -p "$DIR" || fail "Cannot create cache directory: $DIR"
@@ -28,7 +24,6 @@ ensure_helper() {
   HELPER="$BIN"
 }
 
-# prompts answer on stderr, so a function's result on stdout stays clean
 ask() { # $1=prompt $2=default -> REPLY
   local D="${2:-}"
   while :; do
@@ -67,14 +62,12 @@ usage() {
   echo "env: SIDEX_TEAM=XXXXXXXXXX  skip Team ID detection (multiple Apple IDs)"
 }
 
-# --- devices: everything is read from the device via devicectl ---
 
 devices_json() {
   if [ -n "${SIDEX_DEVICES_JSON:-}" ]; then cat "$SIDEX_DEVICES_JSON"
   else xcrun devicectl list devices -j /dev/stdout 2>/dev/null; fi
 }
 
-# one line per real iPhone/iPad: "UDID|Name (iOS x.y, USB)"
 list_devices() {
   ensure_helper
   devices_json | "$HELPER" devices
@@ -98,7 +91,6 @@ select_device() { # sets UDID; asks when several devices are connected
   done
 }
 
-# --- installed apps, also read from the device ---
 
 device_apps() { # caches the device app list in APPS_JSON for this run
   [ -n "${APPS_JSON:-}" ] && return 0
@@ -109,15 +101,12 @@ device_apps() { # caches the device app list in APPS_JSON for this run
   fi
 }
 
-# $1 = all | team | pair-targets   [$2 = team]
-# prints "Name\tBundleID\tteam|" lines; extensions of listed apps are dropped
 apps_query() {
   ensure_helper
   device_apps
   printf '%s' "${APPS_JSON:-}" | "$HELPER" apps "$1" "${2:-}"
 }
 
-# $1 = bundle id or (part of) display name -> prints bundle id
 resolve_bundle() {
   local q="$1" L
   case "$q" in *.*) echo "$q"; return 0;; esac
@@ -141,7 +130,6 @@ resolve_bundle() {
     }' || fail "No single installed app matches '$q'"
 }
 
-# interactive target chooser: prints the chosen bundle id on stdout, rc=1 if skipped
 pick_app() {
   local LIST I=0 NM B MK ANS
   LIST="$(apps_query pair-targets)"
@@ -173,8 +161,6 @@ pick_app() {
   done
 }
 
-# Team IDs Xcode can sign with: the Capabilities files Xcode writes per bundle, plus
-# the "Apple Development" identities in the keychain (one team per certificate).
 xcode_teams() {
   local F N T
   for F in "$HOME/Library/Developer/Xcode/UserData/Capabilities/"*-bundle.json; do
@@ -188,7 +174,6 @@ xcode_teams() {
   done < <(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development[^"]*\)".*/\1/p')
 }
 
-# Team IDs that sign apps already installed on the device (empty when none / no device).
 device_teams() {
   [ -n "${UDID:-}" ] || return 0
   ensure_helper
@@ -260,7 +245,6 @@ profile_has_device() { # $1=mobileprovision $2=UDID -> 0 if the profile carries 
   echo "$OUT" | grep -qF "<string>$2</string>"
 }
 
-# Signing identity = SHA-1 of the cert inside the minted profile (must match, or iOS refuses install).
 profile_cert() { # $1=profile -> prints the hash; codesign accepts the hash directly
   [ -f "$1" ] || return 0
   IDS="$(security find-identity -v -p codesigning 2>/dev/null | grep "Apple Development" | \
@@ -272,27 +256,22 @@ profile_cert() { # $1=profile -> prints the hash; codesign accepts the hash dire
   done | head -1
 }
 
-# --- pairing file / certificate push ---
 
-# Pairing-file path in app Documents (table lives in the helper).
 remote_pair_name() { # $1=bundle
   ensure_helper
   "$HELPER" pair-path "$1"
 }
 
-# Stored pairing record from usbmuxd: no sudo (USB cable only).
 pair_record_usbmuxd() { # $1=UDID $2=out file
   ensure_helper
   "$HELPER" fetch-record "$1" "$2"
 }
 
-# Fresh Pair (ProtocolVersion 2, like Xcode): needs the iPhone unlocked, no sudo.
 pair_record_live() { # $1=UDID $2=out file
   ensure_helper
   "$HELPER" pair "$1" "$2"
 }
 
-# Pair via devicectl if needed (asks Trust on fresh Macs); retry until the apps list reads.
 ensure_paired() {
   local N
   for N in 1 2 3; do
@@ -304,7 +283,6 @@ ensure_paired() {
   fail "Could not pair $UDID - connect via USB, tap Trust, keep it unlocked"
 }
 
-# $1=local file $2=bundle $3=remote path inside Documents
 push_to_app() {
   local R
   R="$(xcrun devicectl device copy to --device "$UDID" --source "$1" \
@@ -384,7 +362,6 @@ cmd_cert() {
   [ -n "$KC" ] || KC="$HOME/Library/Keychains/login.keychain-db"
   R="$(security export -k "$KC" -t identities -f pkcs12 -o "$OUT" -P "$PW" 2>&1)" \
     || { echo "$R" | tail -2 >&2; fail "Failed to export identities from $KC"; }
-  # verify with Apple's own parser (openssl can't read Apple's legacy PBE): round-trip through a throwaway keychain
   VD="$(mktemp -d)"; VK="$VD/v.keychain-db"
   security create-keychain -p "$(openssl rand -hex 8)" "$VK" >/dev/null \
     && security import "$OUT" -k "$VK" -P "$PW" -A >/dev/null 2>&1 \
@@ -414,8 +391,6 @@ cmd_cert() {
   fi
 }
 
-# forget this Mac on the iPhone (device-side + usbmuxd copy): the next "sidex pair"
-# shows the Trust dialog again. Needs the USB cable (usbmuxd lists USB only).
 cmd_unpair() {
   select_device; info "Device: $UDID"
   ensure_helper
@@ -439,7 +414,6 @@ cmd_apps() {
   info "Yours: ${TC:-0} - free IDs keep ~3 apps at once"
 }
 
-# --- when sourced (debugging) only the functions above get defined ---
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 
 if [ $# -gt 0 ] && [ ! -f "$1" ]; then
@@ -493,16 +467,13 @@ XV="$(xcodebuild -version 2>/dev/null | head -1 | sed -n 's/^Xcode \([0-9][0-9]*
 [ "${XV:-0}" -ge 15 ] 2>/dev/null || fail "Xcode 15+ required (devicectl era). Found: $(xcodebuild -version 2>/dev/null | head -1)"
 ensure_helper
 
-# --- 1. device: physical iPhones/iPads only; menu if more than one ---
 select_device
 info "Device: $UDID"
 ensure_paired   # the Trust dialog lives here: pair (or re-pair) before anything else talks devicectl
 
-# --- 2. Team ID: env -> teams Xcode knows -> prefer those signing installed apps -> ask ---
 detect_team
 info "Team: $TEAM"
 
-# --- 3. unzip IPA, read bundle ids ---
 WORK="$SCRIPT_DIR/work"; rm -rf "$WORK"; mkdir -p "$WORK"
 unzip -q "$IPA" -d "$WORK" || fail "Failed to unzip IPA"
 APP_DIR=""
@@ -519,13 +490,11 @@ APP_BID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_DIR/Info
   || fail "No CFBundleIdentifier"
 info "App: $APP_BID"
 
-# target app id: reuse the installed one if present, else orig.TEAM
 INSTALLED=""; for TRY in 1 2 3; do
   INSTALLED="$(xcrun devicectl device info apps --device "$UDID" -j /dev/stdout 2>/dev/null | "$HELPER" installed-bundle "$APP_BID")"; [ -n "$INSTALLED" ] && break; sleep 2; done
 if [ -n "$INSTALLED" ]; then APP_NEW="$INSTALLED"; info "Already installed, updating: $APP_NEW (data will be kept)";
 else APP_NEW="$APP_BID.$TEAM"; info "New ID: $APP_NEW"; fi
 
-# free Apple ID keeps ~3 sideloaded apps at once; warn before the 5-minute mint
 if [ -z "$INSTALLED" ]; then
   TALIST="$(apps_query team "$TEAM")"
   TAN="$(printf '%s\n' "$TALIST" | grep -c . || true)"
@@ -538,8 +507,6 @@ if [ -z "$INSTALLED" ]; then
   fi
 fi
 
-# extensions + app clips: app_new + last component of the original
-# field 1 is the path relative to the app dir, without ".appex" (unique per bundle)
 APPEX_LIST=""
 for SUBDIR in PlugIns AppClips; do
 for A in "$APP_DIR"/$SUBDIR/*.appex; do
@@ -553,7 +520,6 @@ done
 done
 if [ -n "$APPEX_LIST" ]; then printf '%s\n' "$APPEX_LIST" | sed -n '/./s/^/  appex: /p'; fi
 
-# --- 4. stub project to mint profiles (auto-registers the device too) ---
 STUB="$WORK/stub"; rm -rf "$STUB"; mkdir -p "$STUB"
 cp -r "$SCRIPT_DIR/tpl.xcodeproj" "$STUB/StubApp.xcodeproj"
 cp -r "$SCRIPT_DIR/tplsrc" "$STUB/StubApp"
@@ -574,8 +540,6 @@ mint() { # $1=bundle $2=profile-out
     fail "Failed to mint profile for $1"
   }
   cp "$WORK/build-tmp/StubApp.app/embedded.mobileprovision" "$2" || fail "No profile in build output for $1"
-  # the profile MUST carry this device already, or iOS fails the install after a
-  # misleading "done" (the -402620398 false-install bug). Fail here with the real cause.
   profile_has_device "$2" "$UDID" || fail "Profile for $1 lacks device $UDID - not registered in your team. Run once from Xcode against the device, then re-run."
 }
 info "Minting profiles..."
@@ -585,12 +549,10 @@ while IFS='|' read -r DIR OB NB; do
   mint "$NB" "$PROF/$(basename "$DIR").mobileprovision" && echo "  ok $DIR"
 done < <(printf '%s\n' "$APPEX_LIST")
 
-# --- 5. signing identity: exactly the certificate the minted profile carries ---
 CERT="$(profile_cert "$PROF/app.mobileprovision")"
 [ -n "$CERT" ] || fail "No keychain identity matches the profile cert. Drop stale Apple Development certs (Xcode -> Settings -> Accounts -> Manage Certificates) and re-run."
 info "Certificate: $CERT"
 
-# --- 6. re-sign: bundle ids + entitlements mirrored from profiles ---
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $APP_NEW" "$APP_DIR/Info.plist" \
   || fail "Failed to set bundle id for the app"
 while IFS='|' read -r DIR OB NB; do
@@ -615,7 +577,6 @@ rm -f "$APP_DIR/embedded.mobileprovision"
 cp "$PROF/app.mobileprovision" "$APP_DIR/embedded.mobileprovision"
 codesign -f -s "$CERT" --entitlements "$PROF/app.entitlements.plist" "$APP_DIR" || fail "Failed to sign the app"
 
-# --- 7. repack, install, launch ---
 OUT="$WORK/signed.ipa"; rm -f "$OUT"
 (cd "$WORK" && zip -qry "$OUT" Payload) || fail "Failed to repack IPA"
 info "Done: $OUT"
