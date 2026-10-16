@@ -6,3 +6,5 @@ build-*/
 *.mobiledevicepairing
 __pycache__/
 LOCAL_NOTES.md
+
+tests/
