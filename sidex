@@ -15,7 +15,8 @@ HELPER=""
 ensure_helper() {
   [ -n "$HELPER" ] && [ -x "$HELPER" ] && return 0
   local SRC="$SCRIPT_DIR/sidex-helper.swift" DIR LOG BIN
-  DIR="${XDG_CACHE_HOME:-$HOME/Library/Caches}/sidex"
+  # the binary lives next to the repo (gitignored), never in the system; one copy only
+  DIR="$SCRIPT_DIR/helper-cache"
   mkdir -p "$DIR" 2>/dev/null || DIR="${TMPDIR:-/tmp}/sidex-${USER:-user}"
   mkdir -p "$DIR" || fail "Cannot create cache directory: $DIR"
   LOG="$DIR/build.log"
@@ -26,6 +27,7 @@ ensure_helper() {
     xcrun swiftc -o "$BIN.new.$$" "$SRC" 2>"$LOG" || { tail -20 "$LOG" >&2; fail "Helper compilation failed (full log: $LOG)"; }
     mv "$BIN.new.$$" "$BIN" || fail "Cannot install the helper into $DIR"
   fi
+  find "$DIR" -name "helper-*" ! -name "$(basename "$BIN")" -delete 2>/dev/null  # keep exactly one live build
   HELPER="$BIN"
 }
 

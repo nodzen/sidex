@@ -33,7 +33,8 @@ Mode, troubleshooting).
 - Nothing else. No Homebrew packages, no Python, no paid account — sidex
   compiles its own tiny native helper (`sidex-helper.swift`) with Xcode's
   `swiftc` on first use — **one time only** (≈1 s on a MacBook Air M5) — then
-  it is cached by source hash in `~/Library/Caches/sidex` and every later run
+  it is cached by source hash next to the repo in `helper-cache/`
+  (gitignored, one copy — old builds are pruned automatically) and every later run
   picks it up instantly.
 
 > Tested on Xcode 27.0 + iOS 27.2. The gate is Xcode 15+ (`devicectl` era), but
