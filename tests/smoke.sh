@@ -42,7 +42,10 @@ cat > "$D/devices.json" <<'EOF'
    "hardware":{"udid":"00008110-000C0FFEE0BADF00","platform":"tvOS","reality":"physical","marketingName":"Apple TV"},
    "software":{"osVersionNumber":{"stringValue":"26.0"}},
    "connection":{"transportType":"localNetwork"},
-   "state":{"name":"Living Room"}}}
+   "state":{"name":"Living Room"}}},
+  {"deviceProperties":{"name":"iPhone SE 2016","osVersionNumber":"15.8"},
+   "hardwareProperties":{"udid":"F1F2F3F4F5F6F7F8F9F0F1F2F3F4F5F6F7F8F9F0","platform":"iOS","deviceType":"iPhone"},
+   "connectionProperties":{"transportType":"wired"}}
 ]}}
 EOF
 
@@ -60,15 +63,36 @@ EOF
 
 check "syntax (bash -n)" bash -n sidex
 
+# --- helper cert-hash: the profile's own certificates (issue 2: profile/signing cert must match) ---
+/usr/bin/openssl req -x509 -newkey rsa:2048 -keyout "$D/k.pem" -out "$D/c.pem" -days 1 -nodes -subj "/CN=sidex-test" 2>/dev/null
+python3 - "$D/fake.mobileprovision" "$D/c.pem" <<'EOF'
+import plistlib, sys, base64, hashlib
+pem = open(sys.argv[2], "rb").read()
+der = base64.b64decode(b"".join(l for l in pem.splitlines() if b"-----" not in l))
+open(sys.argv[1], "wb").write(plistlib.dumps({"DeveloperCertificates": [der]}))
+print(hashlib.sha1(der).hexdigest().upper())
+EOF
+GH="$("$HELPER" cert-hash "$D/fake.mobileprovision")"
+EXPECT="$(python3 - "$D/fake.mobileprovision" <<'EOF'
+import plistlib, sys, hashlib
+print(hashlib.sha1(plistlib.load(open(sys.argv[1], "rb"))["DeveloperCertificates"][0]).hexdigest().upper())
+EOF
+)"
+check "cert-hash: sha1 of the profile's own cert bytes" test "$GH" = "$EXPECT"
+printf '<?xml version="1.0"?>\n<plist version="1.0"><dict/></plist>' > "$D/empty.mobileprovision"
+"$HELPER" cert-hash "$D/empty.mobileprovision" >/dev/null 2>&1
+check "cert-hash: missing certs fail loudly" test $? = 1
+
 # --- devices ---
 OUT="$(SIDEX_DEVICES_JSON="$D/devices.json" bash sidex devices 2>&1)"
 check "devices: physical iPhone listed (new schema)"  grepit "$OUT" "00008150-00100D91028A401C"
 check "devices: old schema device still parsed"       grepit "$OUT" "00008030-0001122334455667"
+check "devices: old dash-less 40-hex UDID accepted"   grepit "$OUT" "F1F2F3F4F5F6F7F8F9F0F1F2F3F4F5F6F7F8F9F0"
 check "devices: USB transport shown"                  grepit "$OUT" "USB"
 check "devices: Wi-Fi transport shown"                grepit "$OUT" "Wi-Fi"
 check "devices: simulator hidden"                     notgrepit "$OUT" "18B6D734"
 check "devices: Apple TV hidden"                      notgrepit "$OUT" "00008110"
-check "devices: exactly 3 devices"                    test "$(printf '%s\n' "$OUT" | grep -c '^  ')" = 3
+check "devices: exactly 4 devices"                    test "$(printf '%s\n' "$OUT" | grep -c '^  ')" = 4
 
 # --- device selection with >1 device ---
 SOUT="$(printf '2\n' | SIDEX_DEVICES_JSON="$D/devices.json" bash -c 'source ./sidex; select_device; echo "$UDID"' 2>/dev/null)"

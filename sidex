@@ -19,7 +19,7 @@ ensure_helper() {
   mkdir -p "$DIR" 2>/dev/null || DIR="${TMPDIR:-/tmp}/sidex-${USER:-user}"
   mkdir -p "$DIR" || fail "Cannot create cache directory: $DIR"
   LOG="$DIR/build.log"
-  BIN="$DIR/helper-$(shasum -a 256 "$SRC" | cut -c1-12)"   # hash = rebuilds when the source changes
+  BIN="$DIR/helper-$(shasum -a 256 "$SRC" | cut -c1-12)-$(uname -m)"   # hash = rebuilds when the source changes; arch = safe cache copy between different Macs
   if [ ! -x "$BIN" ]; then
     echo "==> Compiling the sidex helper (one time, a few seconds)..." >&2
     xcrun -f swiftc >/dev/null 2>&1 || fail "swiftc not found. Install full Xcode (Xcode -> Settings -> Locations)."
@@ -198,7 +198,7 @@ detect_team() {
   echo "$TEAM" | grep -qE '^[A-Z0-9]{10}$' || fail "Does not look like a Team ID: $TEAM"
 }
 
-find_cert() { # needs TEAM set
+find_cert() { # needs TEAM set; matches by certificate, not hash (used by "cert", not by signing)
   CERT="$(security find-identity -v -p codesigning 2>/dev/null | grep "Apple Development" | while IFS= read -r L; do
     N="$(echo "$L" | sed -n 's/.*"\(Apple Development[^"]*\)".*/\1/p')"
     [ -z "$N" ] && continue
@@ -206,6 +206,20 @@ find_cert() { # needs TEAM set
     [ "$OU" = "$TEAM" ] && { echo "$N"; break; }
   done)"
   [ -n "$CERT" ] || fail "No Apple Development certificate for $TEAM"
+}
+
+# Signing identity as SHA-1 of the certificate actually inside the minted profile —
+# profile and signature must use the SAME cert, or iOS refuses the install
+# (the "false install" bug: several same-team dev certs, the profile minted with another).
+profile_cert() { # $1=profile -> prints the hash; codesign accepts the hash directly
+  [ -f "$1" ] || return 0
+  IDS="$(security find-identity -v -p codesigning 2>/dev/null | grep "Apple Development" | \
+    grep -Eo '[A-Fa-f0-9]{40}' | tr 'a-f' 'A-F' | sort -u | tr '\n' ' ')"
+  [ -n "$IDS" ] || return 0
+  "$HELPER" cert-hash "$1" 2>/dev/null | while IFS= read -r H; do
+    H="$(echo "$H" | tr 'a-f' 'A-F')"
+    echo " $IDS" | grep -qF " $H " && { echo "$H"; break; }
+  done | head -1
 }
 
 # --- pairing file / certificate push ---
@@ -462,14 +476,18 @@ if [ -z "$INSTALLED" ]; then
   fi
 fi
 
-# extensions: app_new + last component of the original
+# extensions + app clips: app_new + last component of the original
+# field 1 is the path relative to the app dir, without ".appex" (unique per bundle)
 APPEX_LIST=""
-for A in "$APP_DIR"/PlugIns/*.appex; do
+for SUBDIR in PlugIns AppClips; do
+for A in "$APP_DIR"/$SUBDIR/*.appex; do
   [ -d "$A" ] || continue
   OB="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$A/Info.plist" 2>/dev/null)" || continue
+  REL="${A#"$APP_DIR"/}"; REL="${REL%.appex}"
   SHORT="${OB##*.}"
   APPEX_LIST="$APPEX_LIST
-$(basename "$A" .appex)|$OB|$APP_NEW.$SHORT"
+$REL|$OB|$APP_NEW.$SHORT"
+done
 done
 if [ -n "$APPEX_LIST" ]; then printf '%s\n' "$APPEX_LIST" | sed -n '/./s/^/  appex: /p'; fi
 
@@ -491,23 +509,28 @@ mint() { # $1=bundle $2=profile-out
     fail "Failed to mint profile for $1"
   }
   cp "$WORK/build-tmp/StubApp.app/embedded.mobileprovision" "$2" || fail "No profile in build output for $1"
+  # the profile MUST carry this device already, or iOS fails the install after a
+  # misleading "done" (the -402620398 false-install bug). Fail here with the real cause.
+  security cms -D -i "$2" 2>/dev/null | plutil -extract ProvisionedDevices raw - 2>/dev/null | grep -qF "$UDID" \
+    || fail "Minted profile for $1 has no device $UDID in ProvisionedDevices — device not registered in your team. Fix: Xcode run once against the device, then re-run."
 }
 info "Minting profiles..."
 mint "$APP_NEW" "$PROF/app.mobileprovision" && echo "  ok app"
 while IFS='|' read -r DIR OB NB; do
   [ -z "$DIR" ] && continue
-  mint "$NB" "$PROF/$DIR.mobileprovision" && echo "  ok $DIR"
+  mint "$NB" "$PROF/$(basename "$DIR").mobileprovision" && echo "  ok $DIR"
 done < <(printf '%s\n' "$APPEX_LIST")
 
-# --- 5. cert matching this team ---
-find_cert
+# --- 5. signing identity: exactly the certificate the minted profile carries ---
+CERT="$(profile_cert "$PROF/app.mobileprovision")"
+[ -n "$CERT" ] || fail "No keychain identity matches the profile's certificate. Remove stale Apple Development certificates (Xcode -> Settings -> Accounts -> Manage Certificates) and re-run."
 info "Certificate: $CERT"
 
 # --- 6. re-sign: bundle ids + entitlements mirrored from profiles ---
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $APP_NEW" "$APP_DIR/Info.plist"
 while IFS='|' read -r DIR OB NB; do
   [ -z "$DIR" ] && continue
-  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $NB" "$APP_DIR/PlugIns/$DIR.appex/Info.plist" \
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $NB" "$APP_DIR/$DIR.appex/Info.plist" \
     || fail "Failed to set bundle id for $DIR"
 done < <(printf '%s\n' "$APPEX_LIST")
 "$HELPER" entitlements "$TEAM" "$PROF" "$APP_DIR"
@@ -518,10 +541,10 @@ done < <(find "$APP_DIR" \( -name "*.framework" -o -name "*.dylib" \) -print)
 [ "$NSIGN_ERR" = 0 ] || echo "  Note: $NSIGN_ERR nested binaries kept their old signature — the install may fail" >&2
 while IFS='|' read -r DIR OB NB; do
   [ -z "$DIR" ] && continue
-  B="$APP_DIR/PlugIns/$DIR.appex"
+  B="$APP_DIR/$DIR.appex"
   rm -f "$B/embedded.mobileprovision"
-  cp "$PROF/$DIR.mobileprovision" "$B/embedded.mobileprovision" || fail "Missing profile for $DIR"
-  codesign -f -s "$CERT" --entitlements "$PROF/$DIR.entitlements.plist" "$B" || fail "Failed to sign $DIR"
+  cp "$PROF/$(basename "$DIR").mobileprovision" "$B/embedded.mobileprovision" || fail "Missing profile for $DIR"
+  codesign -f -s "$CERT" --entitlements "$PROF/$(basename "$DIR").entitlements.plist" "$B" || fail "Failed to sign $DIR"
 done < <(printf '%s\n' "$APPEX_LIST")
 rm -f "$APP_DIR/embedded.mobileprovision"
 cp "$PROF/app.mobileprovision" "$APP_DIR/embedded.mobileprovision"

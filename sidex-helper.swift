@@ -705,10 +705,9 @@ func standardInputData() -> Data {
 }
 
 func isUDID(_ text: String) -> Bool {
-    let parts = text.split(separator: "-", omittingEmptySubsequences: false)
-    guard parts.count == 2, parts[0].count == 8, parts[1].count == 16 else { return false }
-    let hex = Set("0123456789abcdefABCDEF")
-    return parts.allSatisfy { $0.allSatisfy { hex.contains($0) } }
+    if text.range(of: "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}$", options: .regularExpression) != nil { return true }
+    // pre-A12 devices have no dashes: 25-40 hex characters
+    return text.range(of: "^[0-9A-Fa-f]{25,40}$", options: .regularExpression) != nil
 }
 
 func jsonRoot(_ data: Data) -> [String: Any]? {
@@ -894,16 +893,35 @@ func certsCommand(_ arguments: [String]) throws {
     try chain.rootPrivateKey.write(to: URL(fileURLWithPath: directory + "/root.pk8"))
 }
 
+/// SHA-1 of every certificate the profile was minted for, uppercase hex, one per line.
+/// The signing identity must be exactly one of these, or iOS refuses the install.
+func certHashCommand(_ arguments: [String]) throws {
+    guard let profilePath = arguments.first else { throw HelperError("usage: cert-hash PROFILE") }
+    let signed = try? run("/usr/bin/security", ["cms", "-D", "-i", profilePath])
+    let raw = try plistDictionary(signed ?? Data(contentsOf: URL(fileURLWithPath: profilePath)))
+    guard let certificates = raw["DeveloperCertificates"] as? [Data], !certificates.isEmpty else {
+        throw HelperError("no DeveloperCertificates in the profile")
+    }
+    for certificate in certificates {
+        print(Insecure.SHA1.hash(data: certificate).map { String(format: "%02X", $0) }.joined())
+    }
+}
+
 func entitlementsCommand(_ arguments: [String]) throws {
     guard arguments.count >= 3 else { throw HelperError("usage: entitlements TEAM PROFILE_DIR APP_DIR") }
     let team = arguments[0], profileDirectory = arguments[1], appDirectory = arguments[2]
     var jobs: [(path: String, name: String)] = [(appDirectory, "app")]
-    let pluginsDirectory = appDirectory + "/PlugIns"
-    let plugins = ((try? FileManager.default.contentsOfDirectory(atPath: pluginsDirectory)) ?? [])
-        .filter { $0.hasSuffix(".appex") }
-        .sorted()
+    var plugins: [(plugin: String, path: String)] = []
+    for subdirectory in ["PlugIns", "AppClips"] {
+        let path = appDirectory + "/" + subdirectory
+        for plugin in ((try? FileManager.default.contentsOfDirectory(atPath: path)) ?? [])
+            .filter({ $0.hasSuffix(".appex") }).sorted()
+        {
+            plugins.append((plugin, path + "/" + plugin))
+        }
+    }
     for plugin in plugins {
-        jobs.append((pluginsDirectory + "/" + plugin, String(plugin.dropLast(".appex".count))))
+        jobs.append((plugin.path, String(plugin.plugin.dropLast(".appex".count))))
     }
     for job in jobs {
         let profilePath = profileDirectory + "/" + job.name + ".mobileprovision"
@@ -944,6 +962,7 @@ enum SidexHelper {
       fetch-record UDID OUT          stored pairing record from usbmuxd
       pair UDID OUT [--timeout SEC]  live "ProtocolVersion 2" pairing
       certs DEVICE_PUB OUTDIR        certificate chain only (tests / debugging)
+      cert-hash PROFILE              SHA-1 of each certificate inside a provisioning profile
       entitlements TEAM PROFDIR APPDIR   entitlements mirroring for re-signing
     """
 
@@ -962,6 +981,7 @@ enum SidexHelper {
         case "fetch-record": try fetchRecordCommand(arguments)
         case "pair": try pairCommand(arguments)
         case "certs": try certsCommand(arguments)
+        case "cert-hash": try certHashCommand(arguments)
         case "entitlements": try entitlementsCommand(arguments)
         default: throw HelperError("unknown command \(command)\n\(usageText)")
         }
