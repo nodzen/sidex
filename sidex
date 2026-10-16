@@ -52,6 +52,10 @@ confirm() { # $1=question -> 0=yes
   case "$R" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
 
+list_has() { # 0 when $1 is an element of the whitespace-separated list in $2
+  case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
 usage() {
   echo "usage:"
   echo "  sidex                                                     interactive menu"
@@ -61,6 +65,7 @@ usage() {
   echo "                                                            export dev identity as .p12 (LiveContainer JIT-less)"
   echo "  sidex devices                                             list connected iPhones/iPads"
   echo "  sidex apps                                                list apps installed on the device"
+  echo "  sidex unpair                                              forget this Mac on the iPhone (Trust asked again)"
   echo ""
   echo "env: SIDEX_TEAM=XXXXXXXXXX  skip Team ID detection (multiple Apple IDs)"
 }
@@ -68,7 +73,7 @@ usage() {
 # --- devices: everything is read from the device via devicectl ---
 
 devices_json() {
-  if [ -n "${SIDEX_DEVICES_JSON:-}" ]; then cat "$SIDEX_DEVICES_JSON"   # ponytail: test hook, see tests/smoke.sh
+  if [ -n "${SIDEX_DEVICES_JSON:-}" ]; then cat "$SIDEX_DEVICES_JSON"   # ponytail: debug hook (a saved devicectl JSON)
   else xcrun devicectl list devices -j /dev/stdout 2>/dev/null; fi
 }
 
@@ -100,7 +105,7 @@ select_device() { # sets UDID; asks when several devices are connected
 
 device_apps() { # caches the device app list in APPS_JSON for this run
   [ -n "${APPS_JSON:-}" ] && return 0
-  if [ -n "${SIDEX_APPS_JSON:-}" ]; then APPS_JSON="$(cat "$SIDEX_APPS_JSON")"   # ponytail: test hook
+  if [ -n "${SIDEX_APPS_JSON:-}" ]; then APPS_JSON="$(cat "$SIDEX_APPS_JSON")"   # ponytail: debug hook
   else
     [ -n "${UDID:-}" ] || fail "No device selected"
     APPS_JSON="$(xcrun devicectl device info apps --device "$UDID" -j /dev/stdout 2>/dev/null)" || APPS_JSON=""
@@ -171,21 +176,63 @@ pick_app() {
   done
 }
 
+# Team IDs Xcode can sign with: the Capabilities files Xcode writes per bundle, plus
+# the "Apple Development" identities in the keychain (one team per certificate).
+xcode_teams() {
+  local F N T
+  for F in "$HOME/Library/Developer/Xcode/UserData/Capabilities/"*-bundle.json; do
+    [ -e "$F" ] || continue
+    T="$(basename "$F" | sed -n 's/.*-\([A-Z0-9]\{10\}\)-bundle\.json/\1/p')"
+    [ -n "$T" ] && printf '%s\n' "$T"
+  done
+  while IFS= read -r N; do
+    T="$(security find-certificate -c "$N" -p 2>/dev/null | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*OU=\([A-Z0-9]\{10\}\).*/\1/p')"
+    [ -n "$T" ] && printf '%s\n' "$T"
+  done < <(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development[^"]*\)".*/\1/p')
+}
+
+# Team IDs that sign apps already installed on the device (empty when none / no device).
+device_teams() {
+  [ -n "${UDID:-}" ] || return 0
+  ensure_helper
+  [ -n "${APPS_JSON:-}" ] || device_apps
+  printf '%s' "${APPS_JSON:-}" | "$HELPER" team-ids
+}
+
 detect_team() {
   TEAM=""
+  local T LIST="" DEV="" INST="" I=0 N=0 MARK
   if [ -n "${SIDEX_TEAM:-}" ]; then
     TEAM="$SIDEX_TEAM"
   else
-    CAND="$(ls ~/Library/Developer/Xcode/UserData/Capabilities/ 2>/dev/null | sed -n 's/.*-\([A-Z0-9]\{10\}\)-bundle\.json/\1/p' | head -1)"
-    [ -n "$CAND" ] && TEAM="$CAND"
-    if [ -z "$TEAM" ]; then
-      TEAM="$(for C in $(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*CN=//p'); do
-        security find-certificate -c "$C" -p 2>/dev/null | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*OU=\([A-Z0-9]\{10\}\).*/\1/p'
-      done | head -1)"
+    for T in $(xcode_teams); do list_has "$T" "$LIST" || LIST="${LIST:+$LIST }$T"; done
+    DEV="$(device_teams)"
+    [ -n "$LIST" ] || LIST="$DEV"   # Xcode knows no team: what the device shows is the best hint
+    for T in $LIST; do list_has "$T" "$DEV" && INST="${INST:+$INST }$T"; done
+    if [ -n "$INST" ] && [ "$INST" != "$LIST" ]; then
+      echo "  Teams signing apps already on this iPhone: $INST - preferring those." >&2
+      LIST="$INST"
     fi
-    if [ -z "$TEAM" ] && [ -n "${UDID:-}" ]; then
-      ensure_helper
-      TEAM="$(xcrun devicectl device info apps --device "$UDID" -j /dev/stdout 2>/dev/null | "$HELPER" team-id)"
+    for T in $LIST; do N=$((N+1)); done
+    if [ "$N" = 1 ]; then
+      TEAM="$LIST"
+    elif [ "$N" -gt 1 ]; then
+      echo "Several Team IDs found:" >&2
+      for T in $LIST; do
+        I=$((I+1)); MARK=""
+        list_has "$T" "$DEV" && MARK="   (signs apps already on this iPhone)"
+        echo "  $I) $T$MARK" >&2
+      done
+      while :; do
+        ask "Team number" 1
+        I=0; TEAM=""
+        for T in $LIST; do
+          I=$((I+1))
+          [ "$I" -eq "$REPLY" ] 2>/dev/null && { TEAM="$T"; break; }
+        done
+        [ -n "$TEAM" ] && break
+        echo "  No team $REPLY." >&2
+      done
     fi
     if [ -z "$TEAM" ]; then
       echo "Could not detect Team ID automatically." >&2
@@ -234,13 +281,11 @@ profile_cert() { # $1=profile -> prints the hash; codesign accepts the hash dire
 
 # --- pairing file / certificate push ---
 
-# remote path inside app Documents, mirrors idevice_pair known apps table
+# path inside the app's Documents for the pairing file; the table itself lives in the
+# helper ("apps pair-targets" ranks by the same keywords, "pair-path" resolves the path)
 remote_pair_name() { # $1=bundle
-  case "$(echo "$1" | tr 'A-Z' 'a-z')" in
-    *livecontainer*) echo "SideStore/Documents/ALTPairingFile.mobiledevicepairing" ;;
-    *stikdebug*|*feather*|*ksign*|*sparsebox*|*protok*|*antrag*|*enswilde*|*reynard*|*stosdebug*) echo "pairingFile.plist" ;;
-    *) echo "ALTPairingFile.mobiledevicepairing" ;;
-  esac
+  ensure_helper
+  "$HELPER" pair-path "$1"
 }
 
 # Ask the usbmuxd daemon for the stored pairing record (same approach as idevice_pair):
@@ -387,6 +432,14 @@ cmd_cert() {
   fi
 }
 
+# forget this Mac on the iPhone (device-side + usbmuxd copy): the next "sidex pair"
+# shows the Trust dialog again. Needs the USB cable (usbmuxd lists USB only).
+cmd_unpair() {
+  select_device; info "Device: $UDID"
+  ensure_helper
+  "$HELPER" unpair "$UDID"
+}
+
 cmd_devices() {
   local L
   L="$(list_devices)"
@@ -404,13 +457,14 @@ cmd_apps() {
   info "Signed with your team: ${TC:-0} — a free Apple ID keeps ~3 sideloaded apps at once"
 }
 
-# --- when sourced (tests/smoke.sh) only the functions above get defined ---
+# --- when sourced (debugging) only the functions above get defined ---
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 
 if [ $# -gt 0 ] && [ ! -f "$1" ]; then
   case "$1" in
     pair) shift; cmd_pair "$@"; exit $? ;;
     cert) shift; cmd_cert "$@"; exit $? ;;
+    unpair) cmd_unpair; exit $? ;;
     devices) cmd_devices; exit $? ;;
     apps) cmd_apps; exit $? ;;
     help|--help|-h) usage; exit 0 ;;
@@ -462,7 +516,7 @@ select_device
 info "Device: $UDID"
 ensure_paired   # the Trust dialog lives here: pair (or re-pair) before anything else talks devicectl
 
-# --- 2. Team ID: env -> Capabilities -> keychain -> installed-apps heuristic -> ask ---
+# --- 2. Team ID: env -> teams Xcode knows -> prefer those signing installed apps -> ask ---
 detect_team
 info "Team: $TEAM"
 
@@ -555,7 +609,8 @@ CERT="$(profile_cert "$PROF/app.mobileprovision")"
 info "Certificate: $CERT"
 
 # --- 6. re-sign: bundle ids + entitlements mirrored from profiles ---
-/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $APP_NEW" "$APP_DIR/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $APP_NEW" "$APP_DIR/Info.plist" \
+  || fail "Failed to set bundle id for the app"
 while IFS='|' read -r DIR OB NB; do
   [ -z "$DIR" ] && continue
   /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $NB" "$APP_DIR/$DIR.appex/Info.plist" \

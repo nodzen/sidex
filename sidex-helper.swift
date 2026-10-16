@@ -8,12 +8,13 @@
 // Subcommands:
 //   devices                        devicectl "list devices" JSON on stdin -> "UDID|Name (iOS x, USB)" lines
 //   apps MODE [TEAM]               devicectl "info apps" JSON on stdin -> "Name<TAB>Bundle<TAB>team" lines
-//   team-id                        devicectl apps JSON on stdin -> the Team ID found inside bundle ids
+//   team-ids                       devicectl apps JSON on stdin -> Team IDs found in bundle ids, one per line
 //   installed-bundle WANT          devicectl apps JSON on stdin -> installed bundle id (the app itself if present)
 //   fetch-record UDID OUT          stored pairing record from usbmuxd: no sudo, no Full Disk Access
 //   unpair UDID                    forget this Mac on the iPhone (Trust dialog next time), no sudo
 //   pair UDID OUT [--timeout SEC]  live "ProtocolVersion 2" pairing (the same handshake Xcode uses)
-//   certs DEVICE_PUB OUTDIR        just the certificate chain (tests / debugging)
+//   pair-path BUNDLE               where the pairing record goes inside the app's Documents
+//   certs DEVICE_PUB OUTDIR        just the certificate chain (debugging)
 //   entitlements TEAM PROFDIR APPDIR   entitlements mirroring for re-signing
 //
 // The pairing protocol is cross-checked against pymobiledevice3 (doronz88) and
@@ -105,7 +106,7 @@ func plistDictionary(_ data: Data) throws -> [String: Any] {
 let maxMessage = 16 * 1024 * 1024
 
 func usbmuxSocketPath() -> String {
-    let path = ProcessInfo.processInfo.environment["SIDEX_USBMUXD_SOCKET"]  // env = test hook
+    let path = ProcessInfo.processInfo.environment["SIDEX_USBMUXD_SOCKET"]  // env override for debugging
     return (path?.isEmpty == false) ? path! : "/var/run/usbmuxd"
 }
 
@@ -735,6 +736,9 @@ func pair(udid: String, outPath: String, sockPath: String, timeout: Double) thro
     record["HostPrivateKey"] = chain.hostPrivateKey
     if let escrow = response["EscrowBag"] as? Data { record["EscrowBag"] = escrow }
     try writeFile(path: outPath, data: try plistData(record))
+    // the Pair connection is done with. Close it before opening the next one, or a
+    // serial usbmuxd is left serving this socket while SavePairRecord waits on a new one.
+    try? close(fd)
     do { _ = try muxRequest(["MessageType": "SavePairRecord", "PairRecordID": udid,
                              "PairRecordData": try plistData(record)], sockPath: sockPath) }
     catch {
@@ -745,7 +749,6 @@ func pair(udid: String, outPath: String, sockPath: String, timeout: Double) thro
     // validateSession notes benign problems itself; impersonation comes back as
     // ImpostorError and must erase a possibly fake record. Anything else (dead socket,
     // server gone) only downgrades the check to a Note: keep the good record.
-    try? close(fd)
     do {
         let validateFD = try muxConnect(deviceID, port: 62078, sockPath: sockPath)
         defer { close(validateFD) }
@@ -821,6 +824,32 @@ func matchesTeam(_ bundle: String, team: String) -> Bool {
     return bundle.range(of: pattern, options: .regularExpression) != nil
 }
 
+/// The apps sidex can hand a pairing record to: keyword to match against the app's
+/// name/bundle id, ranked best first, and the destination inside the app's Documents.
+/// Single source of truth: "apps pair-targets" ranks with it, "pair-path" resolves it.
+let pairTargets: [(keyword: String, path: String)] = [
+    ("sidestore", "ALTPairingFile.mobiledevicepairing"),
+    ("livecontainer", "SideStore/Documents/ALTPairingFile.mobiledevicepairing"),
+    ("stikdebug", "pairingFile.plist"),
+    ("feather", "pairingFile.plist"),
+    ("ksign", "pairingFile.plist"),
+    ("sparsebox", "pairingFile.plist"),
+    ("protok", "pairingFile.plist"),
+    ("antrag", "pairingFile.plist"),
+    ("enswilde", "pairingFile.plist"),
+    ("reynard", "pairingFile.plist"),
+    ("stosdebug", "pairingFile.plist"),
+]
+
+/// Anything unrecognised (SideStore included) reads the ALTPairingFile from Documents.
+let defaultPairPath = "ALTPairingFile.mobiledevicepairing"
+
+func pairPath(for bundle: String) -> String {
+    let haystack = bundle.lowercased()
+    for target in pairTargets where haystack.contains(target.keyword) { return target.path }
+    return defaultPairPath
+}
+
 func appsCommand(_ arguments: [String]) throws {
     let mode = arguments.first ?? "all"
     let team = arguments.count > 1 ? arguments[1] : ""
@@ -831,11 +860,9 @@ func appsCommand(_ arguments: [String]) throws {
     items = items.filter { item in
         !bundles.contains { other in other != item.bundle && item.bundle.hasPrefix(other + ".") }
     }
-    let pairTargets = ["sidestore", "livecontainer", "stikdebug", "feather", "ksign",
-                       "sparsebox", "protokol", "antrag", "enswilde", "reynard", "stosdebug"]
     func rank(_ item: (name: String, bundle: String)) -> Int {
         let haystack = (item.name + " " + item.bundle).lowercased()
-        for (index, keyword) in pairTargets.enumerated() where haystack.contains(keyword) { return index }
+        for (index, target) in pairTargets.enumerated() where haystack.contains(target.keyword) { return index }
         return 99
     }
     switch mode {
@@ -856,18 +883,18 @@ func appsCommand(_ arguments: [String]) throws {
     }
 }
 
-func teamIDCommand() throws {
+/// Every Team ID visible in the devicectl apps JSON, one per line, in order of first
+/// appearance (bundle ids of sideloaded apps end in .TEAM).
+func teamIDsCommand() throws {
     guard let root = jsonRoot(standardInputData()) else { return }
-    var found: String?
+    var teams: [String] = []
     func walk(_ object: Any) {
-        guard found == nil else { return }
         if let dictionary = object as? [String: Any] {
             if let bundle = dictionary["bundleIdentifier"] as? String,
                let range = bundle.range(of: "\\.[A-Z0-9]{10}(\\.|$)", options: .regularExpression) {
                 var team = String(bundle[range].dropFirst())
                 if team.hasSuffix(".") { team.removeLast() }
-                found = team
-                return
+                if !teams.contains(team) { teams.append(team) }
             }
             for value in dictionary.values { walk(value) }
         } else if let array = object as? [Any] {
@@ -875,7 +902,7 @@ func teamIDCommand() throws {
         }
     }
     walk(root)
-    if let team = found { print(team) }
+    for team in teams { print(team) }
 }
 
 func installedBundleCommand(_ arguments: [String]) throws {
@@ -987,7 +1014,8 @@ func unpairCommand(_ arguments: [String]) throws {
     }
 }
 
-func pairCommand(_ arguments: [String]) throws {    guard arguments.count >= 2 else { throw HelperError("usage: pair UDID OUT [--timeout SECONDS]") }
+func pairCommand(_ arguments: [String]) throws {
+    guard arguments.count >= 2 else { throw HelperError("usage: pair UDID OUT [--timeout SECONDS]") }
     let udid = arguments[0], out = arguments[1]
     var timeout = 120.0
     var index = 2
@@ -1007,6 +1035,13 @@ func pairCommand(_ arguments: [String]) throws {    guard arguments.count >= 2 e
     } catch let error as LockdownError {
         throw HelperError(lockdownHint(error.code))
     }
+}
+
+func pairPathCommand(_ arguments: [String]) throws {
+    guard let bundle = arguments.first, !bundle.isEmpty else {
+        throw HelperError("usage: pair-path BUNDLE")
+    }
+    print(pairPath(for: bundle))
 }
 
 func certsCommand(_ arguments: [String]) throws {
@@ -1086,12 +1121,13 @@ enum SidexHelper {
 
       devices                        devicectl "list devices" JSON on stdin -> "UDID|Name (iOS x, USB)" lines
       apps MODE [TEAM]               devicectl "info apps" JSON on stdin -> "Name<TAB>Bundle<TAB>team" lines
-      team-id                        devicectl apps JSON on stdin -> the Team ID found inside bundle ids
+      team-ids                       devicectl apps JSON on stdin -> Team IDs in bundle ids, one per line
       installed-bundle WANT          devicectl apps JSON on stdin -> installed bundle id
       fetch-record UDID OUT          stored pairing record from usbmuxd
       unpair UDID                    forget this Mac on the iPhone (Trust dialog next time)
       pair UDID OUT [--timeout SEC]  live "ProtocolVersion 2" pairing
-      certs DEVICE_PUB OUTDIR        certificate chain only (tests / debugging)
+      pair-path BUNDLE               where the pairing record goes inside the app's Documents
+      certs DEVICE_PUB OUTDIR        certificate chain only (debugging)
       cert-hash PROFILE              SHA-1 of each certificate inside a provisioning profile
       entitlements TEAM PROFDIR APPDIR   entitlements mirroring for re-signing
     """
@@ -1106,11 +1142,12 @@ enum SidexHelper {
         switch command {
         case "devices": try devicesCommand()
         case "apps": try appsCommand(arguments)
-        case "team-id": try teamIDCommand()
+        case "team-ids": try teamIDsCommand()
         case "installed-bundle": try installedBundleCommand(arguments)
         case "fetch-record": try fetchRecordCommand(arguments)
         case "unpair": try unpairCommand(arguments)
         case "pair": try pairCommand(arguments)
+        case "pair-path": try pairPathCommand(arguments)
         case "certs": try certsCommand(arguments)
         case "cert-hash": try certHashCommand(arguments)
         case "entitlements": try entitlementsCommand(arguments)

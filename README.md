@@ -84,6 +84,8 @@ install just keeps going.
   Import Certificate (JIT-less mode).
 - `sidex devices` — list connected iPhones/iPads. `sidex apps` — list what is
   installed and how many apps count against your free-account limit (~3).
+- `sidex unpair` — forget this Mac on the iPhone (device-side + usbmuxd copy):
+  the next `sidex pair` shows the "Trust This Computer?" dialog again. USB cable.
 - `SIDEX_TEAM=XXXXXXXXXX sidex …` — skip Team ID auto-detection when several
   Apple IDs are in Xcode.
 

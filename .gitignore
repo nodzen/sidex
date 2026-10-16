@@ -1,12 +1,11 @@
 work/
 build-*/
 .DS_Store
-*.xcuserdata
+xcuserdata/
+project.xcworkspace/
 *.p12
 *.mobiledevicepairing
-__pycache__/
 LOCAL_NOTES.md
 
-tests/
 build/
 helper-cache/
