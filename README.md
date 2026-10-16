@@ -28,10 +28,13 @@ Mode, troubleshooting).
 ## Requirements
 
 - macOS + full **Xcode 15+** with your Apple ID logged in (`Xcode → Settings → Accounts`)
-- iPhone connected (USB or same Wi-Fi), Trust tapped, unlocked
+- iPhone connected (USB or same Wi-Fi), unlocked. Trust is no longer a step:
+  if the iPhone is not paired, sidex pairs it itself (see below).
 - Nothing else. No Homebrew packages, no Python, no paid account — sidex
-  compiles its own tiny native helper with Xcode's `swiftc` on first use
-  (a few seconds, then cached in `~/Library/Caches/sidex`).
+  compiles its own tiny native helper (`sidex-helper.swift`) with Xcode's
+  `swiftc` on first use — **one time only** (≈1 s on a MacBook Air M5) — then
+  it is cached by source hash in `~/Library/Caches/sidex` and every later run
+  picks it up instantly.
 
 > Tested on Xcode 27.0 + iOS 27.2. The gate is Xcode 15+ (`devicectl` era), but
 > older devicectl syntax may differ — if it breaks on your version, the error
@@ -52,6 +55,15 @@ Mode, troubleshooting).
 5. Installs via `devicectl` and launches the app. Prints the profile expiry date.
 
 Takes ~5 minutes. Re-run the same command to refresh.
+
+### Automatic pairing
+
+The install used to die with `The device must be paired before it can be
+connected` when the pairing was missing. Now sidex detects it and runs
+`devicectl manage pair` itself — on a fresh Mac the iPhone shows
+**"Trust This Computer?"** (tap it and keep the phone unlocked, the command
+waits), when the phone already knows this Mac it completes silently — then the
+install just keeps going.
 
 ## Flags
 

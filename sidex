@@ -257,6 +257,21 @@ pair_record_live() { # $1=UDID $2=out file
   "$HELPER" pair "$1" "$2"
 }
 
+# devicectl refuses an unpaired phone ("The device must be paired before it can be
+# connected") and the install used to die there. "devicectl manage pair" is the fix:
+# it asks the iPhone for Trust itself when fresh, and completes silently when the
+# phone already knows this Mac. Keep re-checking the app list until it reads back.
+ensure_paired() {
+  local N
+  for N in 1 2 3; do
+    APPS_JSON=""; device_apps
+    [ -n "$APPS_JSON" ] && return 0
+    info "The iPhone is not paired - pairing now; tap \"Trust This Computer\" on it and stay unlocked (waiting)..."
+    xcrun devicectl manage pair --device "$UDID" 2>&1 | tail -6
+  done
+  fail "Could not pair with $UDID - connect via USB, tap Trust, keep the iPhone unlocked"
+}
+
 # $1=local file $2=bundle $3=remote path inside Documents
 push_to_app() {
   local R
@@ -443,6 +458,7 @@ ensure_helper
 # --- 1. device: physical iPhones/iPads only; menu if more than one ---
 select_device
 info "Device: $UDID"
+ensure_paired   # the Trust dialog lives here: pair (or re-pair) before anything else talks devicectl
 
 # --- 2. Team ID: env -> Capabilities -> keychain -> installed-apps heuristic -> ask ---
 detect_team

@@ -11,6 +11,7 @@
 //   team-id                        devicectl apps JSON on stdin -> the Team ID found inside bundle ids
 //   installed-bundle WANT          devicectl apps JSON on stdin -> installed bundle id (the app itself if present)
 //   fetch-record UDID OUT          stored pairing record from usbmuxd: no sudo, no Full Disk Access
+//   unpair UDID                    forget this Mac on the iPhone (Trust dialog next time), no sudo
 //   pair UDID OUT [--timeout SEC]  live "ProtocolVersion 2" pairing (the same handshake Xcode uses)
 //   certs DEVICE_PUB OUTDIR        just the certificate chain (tests / debugging)
 //   entitlements TEAM PROFDIR APPDIR   entitlements mirroring for re-signing
@@ -538,10 +539,12 @@ func tlsReadExactly(_ context: SSLContext, _ count: Int, deadline: Date) throws 
     return output
 }
 
-/// Start a TLS session with the fresh record and prove lockdownd answers on it.
+/// Start a TLS session over the usbmuxd socket, prove the record (pin check),
+/// run one lockdown request inside it (valid for GetValue/UnpairDevice/etc).
 // ponytail: SecureTransport is deprecated since macOS 10.15 — move to Network.framework
 // over the same usbmuxd socket only when Apple actually removes it; it works today.
-func tlsPing(fd: Int32, identity: SecIdentity, record: [String: Any], label: String) throws {
+func tlsRequest(_ fd: Int32, identity: SecIdentity, record: [String: Any], label: String,
+                request: [String: Any]) throws -> [String: Any] {
     guard let context = SSLCreateContext(kCFAllocatorDefault, .clientSide, .streamType) else {
         throw HelperError("cannot create a TLS context")
     }
@@ -592,11 +595,15 @@ func tlsPing(fd: Int32, identity: SecIdentity, record: [String: Any], label: Str
         throw HelperError("TLS handshake failed (status \(status))")
     }
 
-    // pin: the peer must present the certificate from the pairing record
-    guard let expected = record["DeviceCertificate"] as? Data else {
-        throw HelperError("the pairing record has no DeviceCertificate to pin against")
+    // pin: the peer must present the certificate from the pairing record.
+    // Records come with PEM (Apple's) or DER (ours) cert bytes — normalize both
+    // sides through SecCertificate so the comparison is DER vs DER.
+    guard let recordCertData = record["DeviceCertificate"] as? Data,
+          let recordCert = SecCertificateCreateWithData(kCFAllocatorDefault, derFromPEM(recordCertData) as CFData) else {
+        throw HelperError("cannot parse the pairing record's DeviceCertificate")
     }
-        var peerTrustRef: SecTrust?
+    let expected = Data(SecCertificateCopyData(recordCert) as Data)
+    var peerTrustRef: SecTrust?
     guard SSLCopyPeerTrust(context, &peerTrustRef) == errSecSuccess, let peerTrust = peerTrustRef,
           let peers = SecTrustCopyCertificateChain(peerTrust) as? [SecCertificate],
           !peers.isEmpty,
@@ -604,10 +611,10 @@ func tlsPing(fd: Int32, identity: SecIdentity, record: [String: Any], label: Str
         throw ImpostorError()
     }
 
-    let request = try plistData(["Label": label, "Request": "GetValue", "Key": "ProductVersion"])
-    let length = UInt32(request.count).bigEndian
-    var framed = withUnsafeBytes(of: length) { Data($0) }
-    framed.append(request)
+    var message = request
+    message["Label"] = label
+    let payload = try plistData(message)
+    let framed = withUnsafeBytes(of: UInt32(payload.count).bigEndian) { Data($0) } + payload
     try tlsWrite(context, framed, deadline: deadline)
     let header = try tlsReadExactly(context, 4, deadline: deadline)
     let size = header.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt32.self).bigEndian }
@@ -615,8 +622,13 @@ func tlsPing(fd: Int32, identity: SecIdentity, record: [String: Any], label: Str
         throw HelperError("bad lockdownd message length \(size)")
     }
     let body = try tlsReadExactly(context, Int(size), deadline: deadline)
-    _ = try plistDictionary(body)
+    let reply = try plistDictionary(body)
+    if let error = reply["Error"] as? String {
+        if error == "PairingDialogResponsePending" { throw PairingPending() }
+        throw LockdownError(code: error)
+    }
     SSLClose(context)
+    return reply
 }
 
 // MARK: - the pairing itself
@@ -634,7 +646,8 @@ func waitForDeviceValues(_ lockdown: Lockdown, timeout: Double) throws -> (publi
             else { throw HelperError("the iPhone returned no public key") }
             let wifi = (try lockdown.getValue("WiFiAddress")) as? String ?? ""
             return (publicKey, wifi)
-        } catch let error as LockdownError where error.code == "GetProhibited" {
+        } catch let error as LockdownError
+               where ["GetProhibited", "PasswordProtected", "PasscodeRequired"].contains(error.code) {
             guard Date() < deadline else {
                 throw HelperError("the iPhone is locked: unlock it (Home Screen) and run pair again")
             }
@@ -677,10 +690,11 @@ func validateSession(fd: Int32, label: String, record: [String: Any], chain: Cha
         }
         let identity = try makeClientIdentity(certificates: chain.hostCertificate + chain.rootCertificate,
                                               privateKey: chain.hostPrivateKey)
-        try tlsPing(fd: fd, identity: identity, record: record, label: label)
+        _ = try tlsRequest(fd, identity: identity, record: record, label: label,
+                           request: ["Request": "GetValue", "Key": "ProductVersion"])
         eprint("Session check passed: the iPhone accepts the record.")
-    } catch is ImpostorError {
-        throw HelperError("the device presented a certificate that is not the one in the pairing record (possible impersonation); pairing record discarded")
+    } catch let error as ImpostorError {
+        throw error  // the impersonation marker: pair() erases the record and fails loudly
     } catch {
         eprint("Note: could not verify a lockdown session (\(error)); the record is saved anyway.")
     }
@@ -721,11 +735,26 @@ func pair(udid: String, outPath: String, sockPath: String, timeout: Double) thro
     record["HostPrivateKey"] = chain.hostPrivateKey
     if let escrow = response["EscrowBag"] as? Data { record["EscrowBag"] = escrow }
     try writeFile(path: outPath, data: try plistData(record))
+    do { _ = try muxRequest(["MessageType": "SavePairRecord", "PairRecordID": udid,
+                             "PairRecordData": try plistData(record)], sockPath: sockPath) }
+    catch {
+        // without the cache, the next "sidex pair" replays the Trust handshake — works, just clicks
+        eprint("Note: could not cache the record in usbmuxd: the next pair will ask for Trust again")
+    }
+    // lockdownd may kill the mux connection right after Pair: validate on a fresh one.
+    // validateSession notes benign problems itself; impersonation comes back as
+    // ImpostorError and must erase a possibly fake record. Anything else (dead socket,
+    // server gone) only downgrades the check to a Note: keep the good record.
+    try? close(fd)
     do {
-        try validateSession(fd: fd, label: label, record: record, chain: chain)
-    } catch {
+        let validateFD = try muxConnect(deviceID, port: 62078, sockPath: sockPath)
+        defer { close(validateFD) }
+        try validateSession(fd: validateFD, label: label, record: record, chain: chain)
+    } catch is ImpostorError {
         try? FileManager.default.removeItem(atPath: outPath)  // a possibly impersonated record is worse than none
-        throw error
+        throw HelperError("the device presented a certificate that is not the one in the pairing record (possible impersonation); pairing record discarded")
+    } catch {
+        eprint("Note: could not re-verify the session (\(error)); the record is saved anyway.")
     }
 }
 
@@ -900,8 +929,65 @@ func fetchRecordCommand(_ arguments: [String]) throws {
     try writeFile(path: out, data: data)
 }
 
-func pairCommand(_ arguments: [String]) throws {
-    guard arguments.count >= 2 else { throw HelperError("usage: pair UDID OUT [--timeout SECONDS]") }
+/// Forget this Mac on the iPhone: device-side UnpairDevice (authorized with the
+/// very record being thrown away) plus usbmuxd's stored copy. The next
+/// "sidex pair" shows the Trust dialog again, like on a brand-new Mac.
+func unpairCommand(_ arguments: [String]) throws {
+    guard let udid = arguments.first else { throw HelperError("usage: unpair UDID") }
+    let sockPath = usbmuxSocketPath()
+    let deviceID = try muxFindDevice(udid, sockPath: sockPath)
+    let response = try muxRequest(["MessageType": "ReadPairRecord", "PairRecordID": udid],
+                                  sockPath: sockPath, timeoutSeconds: 10)
+    guard let recordData = response["PairRecordData"] as? Data, !recordData.isEmpty else {
+        throw HelperError("no stored pairing record for \(udid) — nothing to unpair")
+    }
+    // the host copy must go too, or "sidex pair" would hand back the dead trust.
+    // Apple's usbmuxd honors DeletePairRecord; older spellings get a polite try too
+    do { _ = try muxRequest(["MessageType": "DeletePairRecord", "PairRecordID": udid],
+                            sockPath: sockPath, timeoutSeconds: 10) }
+    catch { _ = try? muxRequest(["MessageType": "RemovePairRecord", "PairRecordID": udid],
+                                sockPath: sockPath, timeoutSeconds: 10) }
+    let hostCopy = try? muxRequest(["MessageType": "ReadPairRecord", "PairRecordID": udid],
+                                   sockPath: sockPath, timeoutSeconds: 10)
+
+    do {
+        let fd = try muxConnect(deviceID, port: 62078, sockPath: sockPath)
+        defer { close(fd) }
+        let record = try plistDictionary(recordData)
+        let lockdown = Lockdown(fd: fd, label: "sidex-unpair")
+        let session = try lockdown.request("StartSession", [
+            "HostID": record["HostID"] as? String ?? "",
+            "SystemBUID": record["SystemBUID"] as? String ?? "",
+        ])
+        if (session["EnableSessionSSL"] as? Bool) == true {
+            // modern iOS demands TLS after StartSession: same host identity that
+            // validateSession builds, UnpairDevice rides the pinned TLS channel
+            let identity = try makeClientIdentity(
+                certificates: (record["HostCertificate"] as? Data ?? Data())
+                    + (record["RootCertificate"] as? Data ?? Data()),
+                privateKey: record["HostPrivateKey"] as? Data ?? Data())
+            _ = try tlsRequest(fd, identity: identity, record: record, label: "sidex-unpair",
+                               request: ["Request": "UnpairDevice", "PairRecord": record])
+        } else {
+            _ = try lockdown.request("UnpairDevice", ["PairRecord": record])
+        }
+    } catch is ImpostorError {
+        eprint("Note: the device did not accept the TLS UnpairDevice channel (pin failed); if the Trust dialog never shows, reset trust on the iPhone: Settings -> General -> Transfer or Reset -> Reset -> Reset Location & Privacy")
+    } catch let error as LockdownError where error.code == "InvalidHostID" {
+        // the device already forgot this Mac — good, nothing left to do there
+    } catch {
+        // stubby best effort: the Trust dialog can still come from the live pair
+        // handshake once the host copy is gone; say so and move on
+        eprint("Note: device-side unpair failed (\(error)); the host pairing record is wiped anyway")
+    }
+    if (hostCopy?["PairRecordData"] as? Data)?.isEmpty == false {
+        eprint("Note: usbmuxd still holds a host-side copy — sudo rm /var/db/lockdown/\(udid).plist (needs Full Disk Access, sudo alone is not enough)")
+    } else {
+        eprint("Host pairing record removed; the iPhone will ask \"Trust This Computer?\" on the next \"sidex pair\".")
+    }
+}
+
+func pairCommand(_ arguments: [String]) throws {    guard arguments.count >= 2 else { throw HelperError("usage: pair UDID OUT [--timeout SECONDS]") }
     let udid = arguments[0], out = arguments[1]
     var timeout = 120.0
     var index = 2
@@ -1003,6 +1089,7 @@ enum SidexHelper {
       team-id                        devicectl apps JSON on stdin -> the Team ID found inside bundle ids
       installed-bundle WANT          devicectl apps JSON on stdin -> installed bundle id
       fetch-record UDID OUT          stored pairing record from usbmuxd
+      unpair UDID                    forget this Mac on the iPhone (Trust dialog next time)
       pair UDID OUT [--timeout SEC]  live "ProtocolVersion 2" pairing
       certs DEVICE_PUB OUTDIR        certificate chain only (tests / debugging)
       cert-hash PROFILE              SHA-1 of each certificate inside a provisioning profile
@@ -1022,6 +1109,7 @@ enum SidexHelper {
         case "team-id": try teamIDCommand()
         case "installed-bundle": try installedBundleCommand(arguments)
         case "fetch-record": try fetchRecordCommand(arguments)
+        case "unpair": try unpairCommand(arguments)
         case "pair": try pairCommand(arguments)
         case "certs": try certsCommand(arguments)
         case "cert-hash": try certHashCommand(arguments)
@@ -1032,6 +1120,7 @@ enum SidexHelper {
 }
 
 do {
+    signal(SIGPIPE, SIG_IGN)  // sockets die mid-write after Pair; writeAll() already checks errno
     try SidexHelper.dispatch()
 } catch let error as HelperError {
     eprint("ERROR: \(error.message)")

@@ -134,6 +134,8 @@ def serve_lockdown(conn, mode, device_pub, device_key):
         except (EOFError, ConnectionResetError, OSError):
             return
         name = req.get("Request")
+        if os.environ.get("FAKE_USBMUXD_TRACE"):
+            sys.stderr.write("fake lockdown: %s\n" % name)
         if name == "GetValue" and req.get("Key") == "DevicePublicKey":
             resp = {"Error": "GetProhibited"} if mode == "locked" else {"Value": device_pub}
         elif name == "GetValue" and req.get("Key") == "WiFiAddress":
@@ -162,7 +164,7 @@ def serve_lockdown(conn, mode, device_pub, device_key):
 
 
 def serve_live_pair(sock_path, udid, mode):
-    device_pub = None
+    n_lockdowns = 0
     srv = socket.socket(socket.AF_UNIX)
     srv.bind(sock_path)
     srv.listen(1)
@@ -170,19 +172,26 @@ def serve_live_pair(sock_path, udid, mode):
     device_pub = None
     device_key = None
     while True:
+        srv.settimeout(3 if n_lockdowns else 30)  # the helper reconnects instantly or has died
         try:
             conn, _ = srv.accept()
+            if os.environ.get("FAKE_USBMUXD_TRACE"):
+                sys.stderr.write("fake muxd: accepted\n")
         except socket.timeout:
-            sys.exit(1)  # sidex never showed up
+            sys.exit(0 if n_lockdowns else 1)  # helper done -> exit; never showed up -> error
         try:
             req = read_message(conn)
             mt = req.get("MessageType")
+            if os.environ.get("FAKE_USBMUXD_TRACE"):
+                sys.stderr.write("fake muxd: %s\n" % mt)
             if mt == "Connect":
                 send_message(conn, {"MessageType": "Result", "Number": 0})
                 if device_pub is None:
                     device_pub, device_key = device_public_key()
                 serve_lockdown(conn, mode, device_pub, device_key)
-                sys.exit(0)  # the lockdownd session ends the test
+                n_lockdowns += 1
+                if n_lockdowns >= 2:  # pair + validation done; the helper is leaving
+                    sys.exit(0)
             elif mt == "ListDevices":
                 send_message(conn, {"MessageType": "Result", "Number": 0,
                                     "DeviceList": [{"DeviceID": 7,
