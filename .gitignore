@@ -8,3 +8,4 @@ __pycache__/
 LOCAL_NOTES.md
 
 tests/
+build/

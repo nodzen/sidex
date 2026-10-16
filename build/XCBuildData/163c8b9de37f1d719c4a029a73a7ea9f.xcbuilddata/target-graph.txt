@@ -1,2 +1,0 @@
-Target dependency graph (1 target)
-Target 'StubApp' in project 'tpl' (no dependencies)
