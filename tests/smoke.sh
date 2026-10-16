@@ -83,6 +83,19 @@ printf '<?xml version="1.0"?>\n<plist version="1.0"><dict/></plist>' > "$D/empty
 "$HELPER" cert-hash "$D/empty.mobileprovision" >/dev/null 2>&1
 check "cert-hash: missing certs fail loudly" test $? = 1
 
+# --- profile_has_device: the false-install guard (works on a real profile too) ---
+cat > "$D/has.mobileprovision" <<'EOF'
+<?xml version="1.0"?><plist version="1.0"><dict><key>ProvisionedDevices</key>
+<array><string>00008150-00100D91028A401C</string><string>00008142-001C38513EE1401C</string></array></dict></plist>
+EOF
+sed 's/00008150-00100D91028A401C/FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF/' "$D/has.mobileprovision" > "$D/hasnot.mobileprovision"
+SOUT="$(bash -c "source ./sidex; profile_has_device '$D/has.mobileprovision' 00008150-00100D91028A401C && echo yes")"
+check "profile_has_device: device present -> yes"    test "$SOUT" = "yes"
+SOUT="$(bash -c "source ./sidex; profile_has_device '$D/hasnot.mobileprovision' 00008150-00100D91028A401C >/dev/null 2>&1 && echo yes || echo no")"
+check "profile_has_device: device absent -> no"      test "$SOUT" = "no"
+SOUT="$(bash -c "source ./sidex; profile_has_device '$D/empty.mobileprovision' x >/dev/null 2>&1 && echo yes || echo no")"
+check "profile_has_device: not a CMS profile -> no"  test "$SOUT" = "no"
+
 # --- devices ---
 OUT="$(SIDEX_DEVICES_JSON="$D/devices.json" bash sidex devices 2>&1)"
 check "devices: physical iPhone listed (new schema)"  grepit "$OUT" "00008150-00100D91028A401C"

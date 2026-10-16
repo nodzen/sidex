@@ -208,6 +208,14 @@ find_cert() { # needs TEAM set; matches by certificate, not hash (used by "cert"
   [ -n "$CERT" ] || fail "No Apple Development certificate for $TEAM"
 }
 
+profile_has_device() { # $1=mobileprovision $2=UDID -> 0 if the profile carries the device
+  # ponytail: cms or plain help; a CMS envelope is the real path, plain infect tests
+  local OUT
+  OUT="$(security cms -D -i "$1" 2>/dev/null)" || OUT=""
+  [ -n "$OUT" ] || OUT="$(cat "$1" 2>/dev/null)" || return 1
+  echo "$OUT" | grep -qF "<string>$2</string>"
+}
+
 # Signing identity as SHA-1 of the certificate actually inside the minted profile —
 # profile and signature must use the SAME cert, or iOS refuses the install
 # (the "false install" bug: several same-team dev certs, the profile minted with another).
@@ -505,14 +513,16 @@ mint() { # $1=bundle $2=profile-out
     if echo "$R" | grep -qEi "no devices|not registered"; then
       fail "Apple still does not see the device in your team. Fallback: open $STUB/StubApp.xcodeproj in Xcode, select your team, destination = your iPhone, press Run once, then re-run this script." 3
     fi
+    if echo "$R" | grep -qi "maximum App ID limit"; then
+      fail "Apple refused: you used your quota (10 App IDs / 7 days on a free account). Install over an app you already signed with $TEAM (same bundle id reuses its App ID), or re-run in a few days." 4
+    fi
     echo "$R" | grep -E "error:" | head -5 >&2
     fail "Failed to mint profile for $1"
   }
   cp "$WORK/build-tmp/StubApp.app/embedded.mobileprovision" "$2" || fail "No profile in build output for $1"
   # the profile MUST carry this device already, or iOS fails the install after a
   # misleading "done" (the -402620398 false-install bug). Fail here with the real cause.
-  security cms -D -i "$2" 2>/dev/null | plutil -extract ProvisionedDevices raw - 2>/dev/null | grep -qF "$UDID" \
-    || fail "Minted profile for $1 has no device $UDID in ProvisionedDevices — device not registered in your team. Fix: Xcode run once against the device, then re-run."
+  profile_has_device "$2" "$UDID" || fail "Minted profile for $1 has no device $UDID in ProvisionedDevices — device not registered in your team. Fix: Xcode run once against the device, then re-run."
 }
 info "Minting profiles..."
 mint "$APP_NEW" "$PROF/app.mobileprovision" && echo "  ok app"
