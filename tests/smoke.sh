@@ -176,7 +176,8 @@ keys_ok() {
   done
 }
 pem_ok() {
-  [ "$(plutil -extract DeviceCertificate raw -o - "$D/live.plist" 2>/dev/null | base64 -D 2>/dev/null | head -1)" = "-----BEGIN CERTIFICATE-----" ] &&
+  # certificates are DER in the record (Apple's own format); keys stay PEM
+  [ "$(plutil -extract DeviceCertificate raw -o - "$D/live.plist" 2>/dev/null | base64 -D 2>/dev/null | head -c1 | od -An -tu1 | tr -d ' \n')" = "48" ] &&
   [ "$(plutil -extract HostPrivateKey raw -o - "$D/live.plist" 2>/dev/null | base64 -D 2>/dev/null | head -1)" = "-----BEGIN PRIVATE KEY-----" ]
 }
 vals_ok() {
@@ -198,6 +199,19 @@ TOUT="$(SIDEX_USBMUXD_SOCKET="$SOCKT" "$HELPER" pair "00008150-00100D91028A401C"
 wait "$SRV"
 check "pair live: TLS session check passes"    grepit "$TOUT" "Session check passed"
 check "pair live: TLS check has no soft note"  notgrepit "$TOUT" "could not verify a lockdown session"
+check "pair live: pinned cert accepted"        notgrepit "$TOUT" "impersonation"
+
+# a device presenting a certificate from OUTSIDE the record must be rejected (MITM pin)
+SOCKP="$D/usbmuxd-tls-bad.sock"
+python3 tests/fake_usbmuxd.py "$SOCKP" "00008150-00100D91028A401C" - --live-pair tls-bad &
+SRV=$!
+i=0
+while [ ! -S "$SOCKP" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+PERR="$(SIDEX_USBMUXD_SOCKET="$SOCKP" "$HELPER" pair "00008150-00100D91028A401C" "$D/bad-tls.plist" 2>&1)"
+PRC=$?
+wait "$SRV"
+check "TLS pin: impostor certificate rejected"  grepit "$PERR" "not the one in the pairing record"
+check "TLS pin: impostor saves nothing"         bash -c "[ ! -e '$D/bad-tls.plist' ] && [ $PRC -ne 0 ]"
 
 SOCKD="$D/usbmuxd-denied.sock"
 python3 tests/fake_usbmuxd.py "$SOCKD" "00008150-00100D91028A401C" - --live-pair denied &

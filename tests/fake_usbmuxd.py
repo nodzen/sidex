@@ -7,6 +7,7 @@
 #                                                     ListDevices / ReadBUID / no stored
 #                                                     record / Connect to a scripted
 #                                                     lockdownd (MODE = ok | denied | locked)
+import base64
 import os
 import plistlib
 import socket
@@ -64,24 +65,45 @@ def serve_one_shot(sock_path, expect_udid, record_out):
 
 
 def device_public_key():
-    """A PKCS#1 PEM key, the flavor real lockdownd answers with."""
+    """PKCS#1 PEM pubkey + the key path (the TLS fake needs the matching private key)."""
     tmp = tempfile.mkdtemp(prefix="fake-usbmuxd-")
     key = os.path.join(tmp, "device.key")
     subprocess.run([OSSL, "genrsa", "-out", key, "2048"], check=True, stderr=subprocess.DEVNULL)
-    return subprocess.run([OSSL, "rsa", "-in", key, "-pubout", "-RSAPublicKey_out"], check=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+    pub = subprocess.run([OSSL, "rsa", "-in", key, "-pubout", "-RSAPublicKey_out"], check=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+    return pub, key
 
 
-def serve_lockdown_tls(conn):
-    """Serve lockdownd over TLS after StartSession, like a real iPhone."""
+def pem_wrap(der):
+    body = base64.encodebytes(der).decode().replace("\n", "")  # 64-char lines
+    body = "\n".join(body[i:i + 64] for i in range(0, len(body), 64))
+    return "-----BEGIN CERTIFICATE-----\n" + body + "\n-----END CERTIFICATE-----\n"
+
+
+def serve_lockdown_tls(conn, device_key, record, present_bad):
+    """Serve lockdownd over TLS after StartSession, like a real iPhone.
+
+    With a record in hand the server presents exactly the certificate chain from
+    that record (the helper pins on it); without one -- or with present_bad --
+    a throwaway self-signed certificate that must not survive the pin check.
+    """
     import ssl
     tmp = tempfile.mkdtemp(prefix="fake-usbmuxd-tls-")
-    key, crt = os.path.join(tmp, "s.key"), os.path.join(tmp, "s.crt")
-    subprocess.run([OSSL, "genrsa", "-out", key, "2048"], check=True, stderr=subprocess.DEVNULL)
-    subprocess.run([OSSL, "req", "-x509", "-new", "-key", key, "-subj", "/CN=sidex-fake",
-                    "-days", "2", "-out", crt], check=True, stderr=subprocess.DEVNULL)
+    crt = os.path.join(tmp, "chain.pem")
+    certs = [] if present_bad or not isinstance(record, dict) else \
+        [d for d in (record.get("DeviceCertificate"), record.get("RootCertificate")) if isinstance(d, bytes)]
+    if certs:
+        with open(crt, "wb") as f:
+            for der in certs:
+                f.write(pem_wrap(der).encode())
+    else:
+        key, crt2 = os.path.join(tmp, "s.key"), os.path.join(tmp, "s.crt")
+        subprocess.run([OSSL, "genrsa", "-out", key, "2048"], check=True, stderr=subprocess.DEVNULL)
+        subprocess.run([OSSL, "req", "-x509", "-new", "-key", key, "-subj", "/CN=sidex-fake",
+                        "-days", "2", "-out", crt2], check=True, stderr=subprocess.DEVNULL)
+        crt, device_key = crt2, key  # bad presentation: random cert + its own key
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(crt, key)
+    context.load_cert_chain(crt, device_key)
     tls = context.wrap_socket(conn, server_side=True)  # detaches conn; client certs are not requested
     try:
         while True:
@@ -101,9 +123,10 @@ def serve_lockdown_tls(conn):
             pass
 
 
-def serve_lockdown(conn, mode, device_pub):
+def serve_lockdown(conn, mode, device_pub, device_key):
     """lockdownd as the sidex helper sees it: 4-byte big-endian length + plist."""
     pairs = 0
+    record = None
     while True:
         try:
             n = struct.unpack(">I", recvn(conn, 4))[0]
@@ -117,6 +140,7 @@ def serve_lockdown(conn, mode, device_pub):
             resp = {"Value": "aa:bb:cc:dd:ee:ff"}
         elif name == "Pair":
             pairs += 1
+            record = req.get("PairRecord")
             if mode == "denied":
                 resp = {"Error": "UserDeniedPairing"}
             elif pairs == 1:
@@ -124,11 +148,11 @@ def serve_lockdown(conn, mode, device_pub):
             else:
                 resp = {"EscrowBag": b"\x00" * 32}
         elif name == "StartSession":
-            if mode == "tls":
+            if mode in ("tls", "tls-bad"):
                 data = plistlib.dumps({"SessionID": "FAKE-TLS", "EnableSessionSSL": True},
                                       fmt=plistlib.FMT_XML)
                 conn.sendall(struct.pack(">I", len(data)) + data)
-                serve_lockdown_tls(conn)
+                serve_lockdown_tls(conn, device_key, record, present_bad=mode == "tls-bad")
                 return
             resp = {"SessionID": "FAKE-SESSION", "EnableSessionSSL": False}
         else:
@@ -143,6 +167,8 @@ def serve_live_pair(sock_path, udid, mode):
     srv.bind(sock_path)
     srv.listen(1)
     srv.settimeout(30)
+    device_pub = None
+    device_key = None
     while True:
         try:
             conn, _ = srv.accept()
@@ -154,8 +180,8 @@ def serve_live_pair(sock_path, udid, mode):
             if mt == "Connect":
                 send_message(conn, {"MessageType": "Result", "Number": 0})
                 if device_pub is None:
-                    device_pub = device_public_key()
-                serve_lockdown(conn, mode, device_pub)
+                    device_pub, device_key = device_public_key()
+                serve_lockdown(conn, mode, device_pub, device_key)
                 sys.exit(0)  # the lockdownd session ends the test
             elif mt == "ListDevices":
                 send_message(conn, {"MessageType": "Result", "Number": 0,
@@ -177,7 +203,7 @@ def main():
     elif len(sys.argv) == 6 and sys.argv[3] == "-" and sys.argv[4] == "--live-pair":
         serve_live_pair(sys.argv[1], sys.argv[2], sys.argv[5])
     else:
-        sys.exit("usage: fake_usbmuxd.py SOCK UDID RECORD_OUT | SOCK UDID - --live-pair ok|denied|locked|tls")
+        sys.exit("usage: fake_usbmuxd.py SOCK UDID RECORD_OUT | SOCK UDID - --live-pair ok|denied|locked|tls|tls-bad")
 
 
 if __name__ == "__main__":

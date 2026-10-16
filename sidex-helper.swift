@@ -36,8 +36,11 @@ struct LockdownError: Error, CustomStringConvertible {
     var description: String { code }
 }
 
-/// "PairingDialogResponsePending" - the trust dialog is still on screen.
+/// PairingPending - the trust dialog is still on screen.
 struct PairingPending: Error {}
+
+/// The TLS peer did not present the certificate from the record: fatal, drop the record.
+struct ImpostorError: Error {}
 
 func eprint(_ text: String) {
     FileHandle.standardError.write(Data((text + "\n").utf8))
@@ -96,6 +99,9 @@ func plistDictionary(_ data: Data) throws -> [String: Any] {
 }
 
 // MARK: - sockets
+
+/// A reply above this size is a broken parser, not a real message: refuse instead of allocating.
+let maxMessage = 16 * 1024 * 1024
 
 func usbmuxSocketPath() -> String {
     let path = ProcessInfo.processInfo.environment["SIDEX_USBMUXD_SOCKET"]  // env = test hook
@@ -170,7 +176,7 @@ func muxExchange(_ fd: Int32, _ message: [String: Any]) throws -> [String: Any] 
     try writeAll(fd, payload)
     let replyHeader = try readExactly(fd, 16)
     let length = replyHeader.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt32.self) }
-    guard length >= 16 else { throw HelperError("bad usbmuxd message length \(length)") }
+    guard length >= 16, length <= maxMessage else { throw HelperError("bad usbmuxd message length \(length)") }
     return try plistDictionary(try readExactly(fd, Int(length) - 16))
 }
 
@@ -237,6 +243,9 @@ final class Lockdown {
         try writeAll(fd, payload)
         let header = try readExactly(fd, 4)
         let size = header.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt32.self).bigEndian }
+        guard size > 0, size <= UInt32(maxMessage) else {
+            throw HelperError("bad lockdownd message length \(size)")
+        }
         let response = try plistDictionary(try readExactly(fd, Int(size)))
         if let error = response["Error"] as? String {
             if error == "PairingDialogResponsePending" { throw PairingPending() }
@@ -429,6 +438,13 @@ func generateChain(devicePublicKeyPEM: Data, workdir: String) throws -> Chain {
 
 // MARK: - files
 
+/// DER bytes of one PEM block; PEM-less input passes through unchanged.
+func derFromPEM(_ pem: Data) -> Data {
+    let text = String(decoding: pem, as: UTF8.self)
+    let body = text.split(separator: "\n").filter { !$0.hasPrefix("-----") && !$0.isEmpty }.joined()
+    return Data(base64Encoded: body) ?? pem
+}
+
 func makeTempDirectory(_ prefix: String) throws -> String {
     let path = NSTemporaryDirectory() + prefix + UUID().uuidString
     try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
@@ -523,7 +539,9 @@ func tlsReadExactly(_ context: SSLContext, _ count: Int, deadline: Date) throws 
 }
 
 /// Start a TLS session with the fresh record and prove lockdownd answers on it.
-func tlsPing(fd: Int32, identity: SecIdentity, label: String) throws {
+// ponytail: SecureTransport is deprecated since macOS 10.15 — move to Network.framework
+// over the same usbmuxd socket only when Apple actually removes it; it works today.
+func tlsPing(fd: Int32, identity: SecIdentity, record: [String: Any], label: String) throws {
     guard let context = SSLCreateContext(kCFAllocatorDefault, .clientSide, .streamType) else {
         throw HelperError("cannot create a TLS context")
     }
@@ -554,8 +572,10 @@ func tlsPing(fd: Int32, identity: SecIdentity, label: String) throws {
     SSLSetIOFuncs(context, readCallback, writeCallback)
     SSLSetConnection(context, UnsafeMutableRawPointer(connection))
     SSLSetCertificate(context, [identity] as CFArray)
-    // the device's chain is not Apple-signed and must not be verified (python used CERT_NONE);
-    // break on server auth and simply continue, exactly like not checking the peer at all
+    // the device's chain is not Apple-signed: CA verification is meaningless here.
+    // Security is the pin check below instead: the presented certificate must be the
+    // exact same bytes that are in the pairing record (a MITM cannot present the
+    // device's leaf without holding the device's private key).
     SSLSetSessionOption(context, .breakOnServerAuth, true)
     SSLSetProtocolVersionMin(context, .tlsProtocol12)
     SSLSetProtocolVersionMax(context, .tlsProtocol12)
@@ -572,6 +592,18 @@ func tlsPing(fd: Int32, identity: SecIdentity, label: String) throws {
         throw HelperError("TLS handshake failed (status \(status))")
     }
 
+    // pin: the peer must present the certificate from the pairing record
+    guard let expected = record["DeviceCertificate"] as? Data else {
+        throw HelperError("the pairing record has no DeviceCertificate to pin against")
+    }
+        var peerTrustRef: SecTrust?
+    guard SSLCopyPeerTrust(context, &peerTrustRef) == errSecSuccess, let peerTrust = peerTrustRef,
+          let peers = SecTrustCopyCertificateChain(peerTrust) as? [SecCertificate],
+          !peers.isEmpty,
+          peers.contains(where: { Data(SecCertificateCopyData($0) as Data) == expected }) else {
+        throw ImpostorError()
+    }
+
     let request = try plistData(["Label": label, "Request": "GetValue", "Key": "ProductVersion"])
     let length = UInt32(request.count).bigEndian
     var framed = withUnsafeBytes(of: length) { Data($0) }
@@ -579,6 +611,9 @@ func tlsPing(fd: Int32, identity: SecIdentity, label: String) throws {
     try tlsWrite(context, framed, deadline: deadline)
     let header = try tlsReadExactly(context, 4, deadline: deadline)
     let size = header.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt32.self).bigEndian }
+    guard size > 0, size <= UInt32(maxMessage) else {
+        throw HelperError("bad lockdownd message length \(size)")
+    }
     let body = try tlsReadExactly(context, Int(size), deadline: deadline)
     _ = try plistDictionary(body)
     SSLClose(context)
@@ -627,9 +662,9 @@ func pairHandshake(_ lockdown: Lockdown, options: [String: Any], timeout: Double
     }
 }
 
-/// StartSession + TLS with the fresh record: proves the iPhone accepts it. Never
-/// fatal - the Pair handshake already succeeded and the record is already saved.
-func validateSession(fd: Int32, label: String, record: [String: Any], chain: Chain) {
+/// StartSession + TLS with the fresh record: proves the iPhone accepts it. Soft on
+/// technical hiccups (the Pair handshake already succeeded), fatal on an impostor cert.
+func validateSession(fd: Int32, label: String, record: [String: Any], chain: Chain) throws {
     do {
         let lockdown = Lockdown(fd: fd, label: label)
         let response = try lockdown.request("StartSession", [
@@ -642,8 +677,10 @@ func validateSession(fd: Int32, label: String, record: [String: Any], chain: Cha
         }
         let identity = try makeClientIdentity(certificates: chain.hostCertificate + chain.rootCertificate,
                                               privateKey: chain.hostPrivateKey)
-        try tlsPing(fd: fd, identity: identity, label: label)
+        try tlsPing(fd: fd, identity: identity, record: record, label: label)
         eprint("Session check passed: the iPhone accepts the record.")
+    } catch is ImpostorError {
+        throw HelperError("the device presented a certificate that is not the one in the pairing record (possible impersonation); pairing record discarded")
     } catch {
         eprint("Note: could not verify a lockdown session (\(error)); the record is saved anyway.")
     }
@@ -665,10 +702,11 @@ func pair(udid: String, outPath: String, sockPath: String, timeout: Double) thro
     defer { try? FileManager.default.removeItem(atPath: workdir) }
     let chain = try generateChain(devicePublicKeyPEM: publicKey, workdir: workdir)
     var record: [String: Any] = [
-        "DeviceCertificate": chain.deviceCertificate,
-        "HostCertificate": chain.hostCertificate,
+        // certificates go DER-style: that is how Apple's own pairing records store them
+        "DeviceCertificate": derFromPEM(chain.deviceCertificate),
+        "HostCertificate": derFromPEM(chain.hostCertificate),
         "HostID": UUID().uuidString.uppercased(),
-        "RootCertificate": chain.rootCertificate,
+        "RootCertificate": derFromPEM(chain.rootCertificate),
         "RootPrivateKey": chain.rootPrivateKey,
         "WiFiMACAddress": wifi,
         "SystemBUID": buid,
@@ -683,7 +721,12 @@ func pair(udid: String, outPath: String, sockPath: String, timeout: Double) thro
     record["HostPrivateKey"] = chain.hostPrivateKey
     if let escrow = response["EscrowBag"] as? Data { record["EscrowBag"] = escrow }
     try writeFile(path: outPath, data: try plistData(record))
-    validateSession(fd: fd, label: label, record: record, chain: chain)
+    do {
+        try validateSession(fd: fd, label: label, record: record, chain: chain)
+    } catch {
+        try? FileManager.default.removeItem(atPath: outPath)  // a possibly impersonated record is worse than none
+        throw error
+    }
 }
 
 func lockdownHint(_ code: String) -> String {
