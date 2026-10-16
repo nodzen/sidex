@@ -1,31 +1,28 @@
 # sidex beginner guide
 
-`sidex` installs any `.ipa` on your iPhone using only your Mac and a free Apple ID.
-No Sideloadly, no AltStore server, no Anisette, no paid account. If those tools are
-down (or you just don't trust them), this still works — because it uses Apple's
-own client (Xcode) instead of third-party login flows.
+`sidex` installs any `.ipa` on your iPhone with just your Mac and a free Apple
+ID — no Sideloadly, no AltStore server, no paid account. It uses Xcode's own
+login, so third-party outages don't affect it.
 
 ## Minimum versions
 
 | Thing | Minimum | Notes |
 |---|---|---|
-| Mac | anything running macOS 13.5+ (Ventura) | Intel and Apple Silicon both fine |
-| Xcode | **15+**, full app (not CLT-only) | Free from the App Store, ~7–15 GB download. Tested on 27.0; older 15.x–26.x should work but devicectl syntax varied across versions — report breakage |
-| iPhone | iOS 15+ (tested on 27.2) | Beta iOS needs matching/beta Xcode, see below |
-| Apple ID | free is fine | Paid also works (fewer limits) |
+| Mac | macOS 13.5+ | Intel and Apple Silicon |
+| Xcode | **15+**, full app (not CLT-only) | Free from the App Store. Tested on 27.0; older devicectl syntax may differ |
+| iPhone | iOS 15+ (tested on 27.2) | Beta iOS needs matching beta Xcode, see below |
+| Apple ID | free is fine | Paid works too (fewer limits) |
 
-Older Macs that can't run Xcode 15 (stuck on Monterey or earlier) cannot use this —
-there is no `devicectl` there. That's a hard wall, not a bug.
+No `devicectl` below Xcode 15 (Monterey and earlier) — that Mac can't run this.
 
 ## Before you run (one-time, ~10 min)
 
 1. **Install Xcode** from the App Store and open it once.
-2. **Log in:** Xcode → Settings → Accounts → `+` → Apple ID. Any Apple ID works,
-   burner included.
-3. **Connect iPhone** via USB (Wi-Fi works too once paired). Tap **Trust** on the
-   phone, keep it **unlocked**.
+2. **Log in:** Xcode → Settings → Accounts → `+` → Apple ID.
+3. **Connect iPhone** via USB (Wi-Fi works once paired). Tap **Trust**, keep it
+   **unlocked**.
 4. **Developer Mode:** iPhone → Settings → Privacy & Security → Developer Mode → ON.
-   (Required since iOS 16 to run self-signed apps. Reboot if you just enabled it.)
+   (Needed since iOS 16. Reboot if you just enabled it.)
 
 ## Run it
 
@@ -33,75 +30,60 @@ there is no `devicectl` there. That's a hard wall, not a bug.
 /bin/bash sidex /path/to/app.ipa
 ```
 
-No path? Just run `/bin/bash sidex` — you get a menu (install / certificate /
-pairing), and for install you can **drag & drop** the `.ipa` file straight
-into the terminal window, then press Enter.
+No path? Run `/bin/bash sidex` — a menu appears, and you can **drag & drop**
+the `.ipa` into the terminal.
 
-What happens (all automatic, ~5 min):
+What happens (~5 min, all automatic):
 
 ```
-==> Device: 00008150-00100D91028A401C     # your iPhone, found by itself
-==> Team: XXXXXXXXXX                      # your Team ID, found by itself
+==> Device: 00008150-00100D91028A401C
+==> Team: XXXXXXXXXX
 ==> App: com.example.app
 ==> New ID: com.example.app.XXXXXXXXXX    # or "Already installed, updating"
-  ok app / ok Widget / ...                # one provisioning profile per bundle
-==> Certificate: Apple Development: ...   # created in your keychain if missing
-==> Done: .../signed.ipa
+  ok app / ok Widget / ...                # one profile per bundle
 ==> Profile valid until: 2026-10-19...    # free profiles live 7 days
-Launched application ...                  # installed and started on your phone
+Launched application ...                  # installed and started
 ```
 
-If the app was already installed, it **updates in place** — data is kept.
+Already installed? It **updates in place** — data is kept.
 
 ## The one GUI step (fallback only)
 
-Normally the script asks Apple to register a freshly connected device by
-itself. If that fails you'll see:
+If Apple doesn't see a fresh device in your team you'll get:
 
 > Apple still does not see the device in your team. Fallback: open …/StubApp.xcodeproj in Xcode, select your team, destination = your iPhone, press Run once, then re-run this script.
 
-Do exactly that (a throwaway blank app builds and registers the device), then run
-the script again. You do this once per new device, never again.
+Do that once per new device, then re-run. Never needed again.
 
 ## Weekly refresh
 
-Free provisioning profiles expire after **7 days** — then the app stops opening.
-That's Apple's rule for everyone (Sideloadly apps die the same way). Just run the
-same command again; it re-issues profiles and updates the app, data is kept.
+Free profiles expire after **7 days** — the app stops opening. Just re-run the
+same command; data is kept.
 
 ## Options
 
-- `--keep-watch` — keep the Apple Watch app inside the IPA. Removed by default:
-  free accounts cannot sign it and it breaks installation. You don't need it on
-  the phone anyway.
+- `--keep-watch` — keep the Watch app. Stripped by default (free accounts can't
+  sign it).
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `Xcode 15+ required` | Install/update full Xcode from the App Store (not CLT) |
+| `Xcode 15+ required` | Install full Xcode from the App Store (not CLT) |
 | `No iPhone found` | Cable/Wi-Fi, Trust tapped, phone unlocked; same network for Wi-Fi |
-| `Failed to mint profile for …` + Apple error text | Read the Apple error: usually device not registered (see the GUI fallback above) or App ID quota full (see below) |
-| `not enough available app IDs` | Free teams get ~10 App IDs, no web UI to delete them. Reinstalling the same apps reuses IDs; constantly new apps exhaust the quota |
-| Pairing hangs on `Unlock the iPhone and keep it on the Home Screen` | A Mac with no pairing record yet makes `sidex pair` pair with the iPhone itself (the same handshake Xcode uses). Unlock the phone, leave it on the Home Screen, tap **Trust** on the dialog. Works on a clean Mac — no sudo, no Full Disk Access |
-| Pairing file: sudo password asked / `Operation not permitted` | `sidex pair` prefers usbmuxd — no sudo, no permissions needed (unlocked iPhone on the USB cable). Only if usbmuxd has no record does it fall back to `/var/db/lockdown`, which needs **Full Disk Access** for your terminal app (sudo does not bypass it): System Settings → Privacy & Security → Full Disk Access → add Terminal/Ghostty/etc., quit it (Cmd+Q), reopen, retry |
-| Beta iOS + stable Xcode: device unsupported | Install matching beta Xcode (free), switch with `sudo xcode-select -s`, re-run |
-| App installs but a widget/extension is dead | That extension needs a capability free profiles can't grant (App Groups etc.) — install works, that feature degrades |
-| No notifications ever | Normal on free accounts: Apple doesn't issue push entitlements without paid membership |
+| `Failed to mint profile for …` | Read Apple's error: device not registered (GUI step above) or App ID quota full (below) |
+| `not enough available app IDs` | Free teams get ~10 App IDs. Reinstalling reuses them; new apps exhaust the quota |
+| Pairing hangs on `Unlock the iPhone…` | Unlock the phone, stay on the Home Screen, tap **Trust**. Works on a clean Mac, no sudo |
+| sudo asked / `Operation not permitted` | Only the `/var/db/lockdown` fallback needs Full Disk Access (sudo doesn't bypass it): enable it for your terminal app, quit (Cmd+Q), reopen, retry |
+| Beta iOS + stable Xcode | Install matching beta Xcode, `sudo xcode-select -s`, re-run |
+| Widget/extension dead | It needs a capability free profiles can't grant — the app installs, that feature degrades |
+| No notifications | Normal: no push entitlements on free accounts |
 
 ## FAQ
 
-**Windows/Linux?** No — this needs Xcode by design.
+**Windows/Linux?** No — needs Xcode by design.
 
-**Why not Sideloadly/AltStore?** Those are great when their servers work. They log
-into Apple through emulated third-party flows; when Apple tightens that endpoint,
-they all break at once. `sidex` uses Xcode's genuine session, so server outages
-don't affect it.
+**Jailbreak / warranty?** No. Standard free-tier dev signing, like Xcode does.
 
-**Is this a jailbreak / does it void warranty?** No. It's standard free-tier
-development signing — the same thing Xcode does with your own apps.
-
-**3-app limit?** Free Apple IDs can keep ~3 sideloaded apps installed at once.
-`sidex apps` shows how many count against the limit, and the installer warns
-and lists them when you're at 3. iOS refuses a 4th — delete something on the
-phone and retry.
+**3-app limit?** Free IDs keep ~3 apps at once. `sidex apps` shows the count;
+iOS refuses a 4th — delete one on the phone and retry.

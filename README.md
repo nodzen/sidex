@@ -1,15 +1,13 @@
 # sidex
 
-Install any `.ipa` on your iPhone with a **free Apple ID** — using only Xcode.
-No third-party servers, no Anisette, no signing services.
+Install any `.ipa` on your iPhone with a **free Apple ID** — Xcode only.
+No servers, no Anisette, no signing services.
 
 ## Why
 
-Tools like Sideloadly, AltStore and iLoader log into Apple through GrandSlam with
-emulated Anisette. Whenever Apple tightens that endpoint, they all break at once
-— and you're stuck waiting for an update. `sidex` takes the boring road instead:
-Apple's own client (Xcode) with your own login. There is no third-party login to
-block, so server outages don't affect it.
+Sideloadly/AltStore log into Apple via emulated Anisette; when Apple tightens
+it, they all break at once. `sidex` uses Xcode's own login, so there is nothing
+third-party to block.
 
 ## Install
 
@@ -19,81 +17,54 @@ cd sidex
 /bin/bash sidex /path/to/app.ipa
 ```
 
-No arguments? You get a menu — install an app, export a certificate or push a
-pairing file. For install you can **drag & drop** the `.ipa` into the terminal.
+No arguments? You get a menu (install / certificate / pairing); you can
+**drag & drop** the `.ipa` into the terminal.
 
-New to this? Follow **[GUIDE.md](GUIDE.md)** step by step (Xcode setup, Developer
-Mode, troubleshooting).
+New to this? See **[GUIDE.md](GUIDE.md)** (Xcode setup, Developer Mode,
+troubleshooting).
 
 ## Requirements
 
-- macOS + full **Xcode 15+** with your Apple ID logged in (`Xcode → Settings → Accounts`)
-- iPhone connected (USB or same Wi-Fi), unlocked. Trust is no longer a step:
-  if the iPhone is not paired, sidex pairs it itself (see below).
-- Nothing else. No Homebrew packages, no Python, no paid account — sidex
-  compiles its own tiny native helper (`sidex-helper.swift`) with Xcode's
-  `swiftc` on first use — **one time only** (≈1 s on a MacBook Air M5) — then
-  it is cached by source hash next to the repo in `helper-cache/`
-  (gitignored, one copy — old builds are pruned automatically) and every later run
-  picks it up instantly.
+- macOS + full **Xcode 15+** with your Apple ID (`Xcode → Settings → Accounts`)
+- iPhone on USB or same Wi-Fi, unlocked. Unpaired phones get paired automatically.
+- Nothing else: the helper (`sidex-helper.swift`) compiles once with `swiftc`
+  (~1 s) and is cached in `helper-cache/`.
 
-> Tested on Xcode 27.0 + iOS 27.2. The gate is Xcode 15+ (`devicectl` era), but
-> older devicectl syntax may differ — if it breaks on your version, the error
-> will be visible (install just won't run), please report it as an issue.
+> Tested on Xcode 27.0 + iOS 27.2. Older devicectl syntax may differ — report
+> breakage as an issue.
 
 ## How it works
 
-1. Finds your iPhone (asks which one if several are connected) and your Team ID
-   — nothing to look up by hand.
-2. Reads the IPA and decides bundle IDs (updates the installed app in place when
-   found, preserving data).
-3. Builds a tiny stub project a few times so Xcode mints a development
-   certificate + provisioning profiles for every bundle (app + extensions), and
-   registers your device with Apple automatically (manual Xcode run is a
-   fallback).
-4. Re-signs everything: bundle IDs namespaced to your team, entitlements
-   mirrored from the profiles, frameworks and extensions signed inside-out.
-5. Installs via `devicectl` and launches the app. Prints the profile expiry date.
+1. Finds your iPhone and Team ID.
+2. Reads the IPA; updates in place if already installed (data kept).
+3. Builds a stub project so Xcode mints profiles for app + extensions (also
+   registers the device; a manual Xcode run is the fallback).
+4. Re-signs everything with your team, entitlements taken from the profiles.
+5. Installs via `devicectl`, launches the app, prints the profile expiry date.
 
-Takes ~5 minutes. Re-run the same command to refresh.
-
-### Automatic pairing
-
-The install used to die with `The device must be paired before it can be
-connected` when the pairing was missing. Now sidex detects it and runs
-`devicectl manage pair` itself — on a fresh Mac the iPhone shows
-**"Trust This Computer?"** (tap it and keep the phone unlocked, the command
-waits), when the phone already knows this Mac it completes silently — then the
-install just keeps going.
+Takes ~5 minutes. Re-run the same command to refresh. A missing pairing is
+fixed mid-install (`devicectl manage pair` — tap Trust on a fresh Mac).
 
 ## Flags
 
-- `--keep-watch` — keep the Apple Watch app inside the IPA (removed by default:
-  free accounts cannot sign it and it breaks installation).
-- `sidex pair [--to NAME|BUNDLE] [--out FILE] [--save-only]` — get the
-  lockdown pairing record and push it into the app's Documents via `devicectl`
-  (SideStore/LiveContainer/StikDebug pick it up from there; without `--to`
-  you choose from apps found **on the device**). Asks usbmuxd first (no sudo,
-  no permissions needed; the iPhone needs the USB cable here). On a fresh Mac
-  with no record at all it runs the same **ProtocolVersion 2 Pair
-  handshake Xcode uses** and pairs with the iPhone itself (unlock the phone,
-  tap Trust). `/var/db/lockdown` with sudo + Full Disk Access remains the
-  last fallback. Lockdown only; RPPairing still needs `idevice_pair`.
-- `sidex cert [--password PW] [--out FILE] [--push-to NAME|BUNDLE]` — export
-  the Apple Development identity as `.p12` for LiveContainer → Settings →
-  Import Certificate (JIT-less mode).
-- `sidex devices` — list connected iPhones/iPads. `sidex apps` — list what is
-  installed and how many apps count against your free-account limit (~3).
-- `sidex unpair` — forget this Mac on the iPhone (device-side + usbmuxd copy):
-  the next `sidex pair` shows the "Trust This Computer?" dialog again. USB cable.
-- `SIDEX_TEAM=XXXXXXXXXX sidex …` — skip Team ID auto-detection when several
-  Apple IDs are in Xcode.
+- `--keep-watch` — keep the Watch app (stripped by default: free accounts
+  cannot sign it).
+- `sidex pair [--to NAME|BUNDLE] [--out FILE] [--save-only]` — pairing file,
+  optionally pushed into the app's Documents (SideStore/LiveContainer/StikDebug
+  read it there; without `--to` you pick from apps on the device). Tries usbmuxd
+  (no sudo, USB cable), then a live Pair handshake, then `/var/db/lockdown`
+  (needs Full Disk Access). Lockdown only.
+- `sidex cert [--password PW] [--out FILE] [--push-to NAME|BUNDLE]` — export the
+  dev identity as `.p12` for LiveContainer → Import Certificate (JIT-less).
+- `sidex devices` / `sidex apps` — list devices / installed apps (free IDs keep
+  ~3).
+- `sidex unpair` — forget this Mac (Trust is asked again). USB cable.
+- `SIDEX_TEAM=XXXXXXXXXX sidex …` — skip Team ID detection with several Apple IDs.
 
-## Honest limits (free Apple ID, Apple's rules — same for every free signer)
+## Limits (Apple's free-tier rules, same for every free signer)
 
-- Profiles live **7 days** — re-run weekly.
-- **10 App IDs** per team — reinstalling the same app reuses them; constantly new
-  apps can exhaust the quota.
-- Special capabilities (App Groups, Push, etc.) only work if already enabled on
-  those App IDs. Push notifications never work on free accounts, anywhere.
-- macOS + Xcode only. No Windows/Linux (needs Xcode by design).
+- Profiles last **7 days** — re-run weekly.
+- **10 App IDs** per team — reinstalls reuse them; constantly new apps exhaust
+  the quota.
+- Push never works; other capabilities only if already on those App IDs.
+- macOS + Xcode only.
