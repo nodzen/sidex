@@ -53,7 +53,7 @@ usage() {
   echo "  sidex                                                     interactive menu"
   echo "  sidex <app.ipa> [--keep-watch]                            install / refresh app"
   echo "  sidex pair [--to NAME|BUNDLE] [--out FILE] [--save-only]  lockdown pairing file, optionally push into app"
-  echo "  sidex cert [--password PW] [--out FILE] [--push-to NAME|BUNDLE]"
+  echo "  sidex cert [--password PW] [--out FILE] [--push-to NAME|BUNDLE] [--import-to NAME|BUNDLE]"
   echo "                                                            export dev identity as .p12 (LiveContainer JIT-less)"
   echo "  sidex devices                                             list connected iPhones/iPads"
   echo "  sidex apps                                                list apps installed on the device"
@@ -341,8 +341,39 @@ cmd_pair() {
   info "Open the app on iPhone — it should pick it up."
 }
 
+export_p12() { # $1=out file $2=password; needs TEAM; prints a message and returns 1 on failure
+  local KC R VD VK SUBJ
+  rm -f "$1"
+  KC="$(security default-keychain 2>/dev/null | tr -d ' "')"
+  [ -n "$KC" ] || KC="$HOME/Library/Keychains/login.keychain-db"
+  R="$(security export -k "$KC" -t identities -f pkcs12 -o "$1" -P "$2" 2>&1)" || {
+    echo "$R" | tail -2 >&2
+    echo "ERROR: failed to export identities from $KC" >&2
+    return 1
+  }
+  chmod 600 "$1" 2>/dev/null || true
+  VD="$(mktemp -d)"; VK="$VD/v.keychain-db"; SUBJ=""
+  security create-keychain -p "$(openssl rand -hex 8)" "$VK" >/dev/null \
+    && security import "$1" -k "$VK" -P "$2" -A >/dev/null 2>&1 \
+    && SUBJ="$(security find-certificate -a -p "$VK" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null)"
+  security delete-keychain "$VK" >/dev/null 2>&1
+  rm -rf "$VD"
+  [ -n "$SUBJ" ] || { echo "ERROR: exported .p12 failed verification (bad .p12)" >&2; return 1; }
+  echo "$SUBJ" | grep -q "OU=$TEAM" \
+    || { echo "ERROR: exported .p12 is not for team $TEAM: $SUBJ" >&2; return 1; }
+}
+
+import_cert() { # $1=bundle $2=p12 $3=password; needs UDID
+  local URL R
+  ensure_helper
+  URL="$("$HELPER" cert-url "$2" "$3")" || { echo "ERROR: cannot build the certificate URL" >&2; return 1; }
+  R="$(xcrun devicectl device process launch --device "$UDID" --terminate-existing \
+    --payload-url "$URL" "$1" 2>&1)" || { echo "$R" | tail -3 >&2; return 1; }
+  echo "$R" | tail -1
+}
+
 cmd_cert() {
-  local PW="" OUT="" PUSH_TO="" BUNDLE=""
+  local PW="" OUT="" PUSH_TO="" IMPORT_TO="" BUNDLE="" NCERTS
   while [ $# -gt 0 ]; do
     case "$1" in
       --password) PW="${2:-}"; shift 2 ;;
@@ -351,42 +382,52 @@ cmd_cert() {
       --out=*) OUT="${1#--out=}"; shift ;;
       --push-to) PUSH_TO="${2:-}"; shift 2 ;;
       --push-to=*) PUSH_TO="${1#--push-to=}"; shift ;;
-      *) fail "Unknown option for cert: $1 (usage: sidex cert [--password PW] [--out FILE] [--push-to NAME|BUNDLE])" ;;
+      --import-to) IMPORT_TO="${2:-}"; shift 2 ;;
+      --import-to=*) IMPORT_TO="${1#--import-to=}"; shift ;;
+      *) fail "Unknown option for cert: $1 (usage: sidex cert [--password PW] [--out FILE] [--push-to NAME|BUNDLE] [--import-to NAME|BUNDLE])" ;;
     esac
   done
   detect_team; info "Team: $TEAM"
   find_cert; info "Certificate: $CERT"
   [ -n "$OUT" ] || OUT="$PWD/AppleDevelopment-$TEAM.p12"
   [ -n "$PW" ] || PW="$(openssl rand -hex 6)"
-  KC="$(security default-keychain 2>/dev/null | tr -d ' "')"
-  [ -n "$KC" ] || KC="$HOME/Library/Keychains/login.keychain-db"
-  R="$(security export -k "$KC" -t identities -f pkcs12 -o "$OUT" -P "$PW" 2>&1)" \
-    || { echo "$R" | tail -2 >&2; fail "Failed to export identities from $KC"; }
-  VD="$(mktemp -d)"; VK="$VD/v.keychain-db"
-  security create-keychain -p "$(openssl rand -hex 8)" "$VK" >/dev/null \
-    && security import "$OUT" -k "$VK" -P "$PW" -A >/dev/null 2>&1 \
-    && SUBJ="$(security find-certificate -a -p "$VK" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null)"
-  security delete-keychain "$VK" >/dev/null 2>&1
-  rm -rf "$VD"
-  [ -n "${SUBJ:-}" ] || fail "Exported file failed verification (bad .p12)"
-  echo "$SUBJ" | grep -q "OU=$TEAM" || fail "Exported .p12 is not for team $TEAM: $SUBJ"
+  export_p12 "$OUT" "$PW" || fail "Certificate export failed"
   NCERTS="$(security find-identity -v -p codesigning 2>/dev/null | grep -c "Apple Development" || true)"
   [ "${NCERTS:-1}" -gt 1 ] 2>/dev/null && info "Note: $NCERTS dev identities exported. Split the .p12 if LiveContainer picks the wrong one."
   info "Certificate file: $OUT"
-  info "Password: $PW  (LiveContainer will ask for it on import)"
-  if [ -n "$PUSH_TO" ]; then
+  info "Password: $PW  (only needed for a manual import)"
+  if [ -n "$PUSH_TO" ] || [ -n "$IMPORT_TO" ]; then
     select_device; info "Device: $UDID"
+  fi
+  if [ -n "$PUSH_TO" ]; then
     BUNDLE="$(resolve_bundle "$PUSH_TO")"
     push_to_app "$OUT" "$BUNDLE" "sidex-cert.p12"
     info "Pushed to $BUNDLE/Documents/sidex-cert.p12"
-  elif [ -t 0 ] && confirm "Push the .p12 to an app on the iPhone now?"; then
+  fi
+  if [ -n "$IMPORT_TO" ]; then
+    BUNDLE="$(resolve_bundle "$IMPORT_TO")"
+    import_cert "$BUNDLE" "$OUT" "$PW" \
+      || fail "Auto-import failed - import $OUT in LiveContainer manually (password: $PW)"
+    info "Imported into $BUNDLE - no file picker, no password typing"
+  fi
+  if [ -z "$PUSH_TO" ] && [ -z "$IMPORT_TO" ] && [ -t 0 ] && confirm "Send the .p12 to an app on the iPhone now?"; then
     select_device; info "Device: $UDID"
     BUNDLE="$(pick_app)" || BUNDLE=""
     if [ -n "$BUNDLE" ]; then
-      push_to_app "$OUT" "$BUNDLE" "sidex-cert.p12"
-      info "Pushed to $BUNDLE/Documents/sidex-cert.p12"
+      case "$(printf '%s' "$BUNDLE" | tr '[:upper:]' '[:lower:]')" in
+        *livecontainer*)
+          if import_cert "$BUNDLE" "$OUT" "$PW"; then
+            info "Imported into $BUNDLE - no file picker, no password typing"
+          else
+            push_to_app "$OUT" "$BUNDLE" "sidex-cert.p12"
+            info "Import failed, pushed to $BUNDLE/Documents/sidex-cert.p12"
+          fi ;;
+        *)
+          push_to_app "$OUT" "$BUNDLE" "sidex-cert.p12"
+          info "Pushed to $BUNDLE/Documents/sidex-cert.p12" ;;
+      esac
     else
-      echo "Not pushed. Later: sidex cert --push-to <Name|BundleID>"
+      echo "Not sent. Later: sidex cert --push-to <Name|BundleID> or --import-to <Name|BundleID>"
     fi
   fi
 }
@@ -524,6 +565,7 @@ STUB="$WORK/stub"; rm -rf "$STUB"; mkdir -p "$STUB"
 cp -r "$SCRIPT_DIR/tpl.xcodeproj" "$STUB/StubApp.xcodeproj"
 cp -r "$SCRIPT_DIR/tplsrc" "$STUB/StubApp"
 PROF="$WORK/profiles"; mkdir -p "$PROF"
+
 mint() { # $1=bundle $2=profile-out
   R="$(xcodebuild -project "$STUB/StubApp.xcodeproj" -target StubApp -configuration Debug \
     -destination "id=$UDID" -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
@@ -588,6 +630,20 @@ else
 fi
 EXP="$(security cms -D -i "$PROF/app.mobileprovision" 2>/dev/null | plutil -extract ExpirationDate raw - 2>/dev/null)"
 info "Profile valid until: $EXP — re-run the script after that"
-R="$(xcrun devicectl device process launch --device "$UDID" "$APP_NEW" 2>&1)" || true
-echo "$R" | tail -1
+LC_APP=""
+case "$(printf '%s' "$APP_NEW" | tr '[:upper:]' '[:lower:]')" in *livecontainer*) LC_APP=1 ;; esac
+if [ -n "$LC_APP" ]; then
+  P12="$WORK/sidex-cert.p12"; PW="$(openssl rand -hex 6)"
+  if export_p12 "$P12" "$PW" && import_cert "$APP_NEW" "$P12" "$PW"; then
+    rm -f "$P12"
+    info "Certificate handed to LiveContainer — no file picker, no password typing."
+  else
+    info "Auto-import failed; import $P12 manually in LiveContainer (password: $PW)"
+    R="$(xcrun devicectl device process launch --device "$UDID" --terminate-existing "$APP_NEW" 2>&1)" || true
+    echo "$R" | tail -1
+  fi
+else
+  R="$(xcrun devicectl device process launch --device "$UDID" "$APP_NEW" 2>&1)" || true
+  echo "$R" | tail -1
+fi
 info "All done."

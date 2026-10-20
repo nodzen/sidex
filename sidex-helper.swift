@@ -978,6 +978,20 @@ func certHashCommand(_ arguments: [String]) throws {
     }
 }
 
+func certURLCommand(_ arguments: [String]) throws {
+    guard arguments.count >= 2 else { throw HelperError("usage: cert-url P12 PASSWORD") }
+    let data = try Data(contentsOf: URL(fileURLWithPath: arguments[0]))
+    // Encode everything except RFC 3986 unreserved characters: URLComponents
+    // leaves "+" alone, which some parsers read as a space.
+    let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+    func escape(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? value
+    }
+    let certificate = escape(data.base64EncodedString())
+    let password = escape(arguments[1])
+    print("livecontainer://certificate?cert=\(certificate)&password=\(password)")
+}
+
 func entitlementsCommand(_ arguments: [String]) throws {
     guard arguments.count >= 3 else { throw HelperError("usage: entitlements TEAM PROFILE_DIR APP_DIR") }
     let team = arguments[0], profileDirectory = arguments[1], appDirectory = arguments[2]
@@ -1036,6 +1050,7 @@ enum SidexHelper {
       pair-path BUNDLE               where the pairing record goes inside the app's Documents
       certs DEVICE_PUB OUTDIR        certificate chain only (debugging)
       cert-hash PROFILE              SHA-1 of each certificate inside a provisioning profile
+      cert-url P12 PASSWORD          livecontainer://certificate URL for a silent cert import
       entitlements TEAM PROFDIR APPDIR   entitlements mirroring for re-signing
     """
 
@@ -1057,6 +1072,7 @@ enum SidexHelper {
         case "pair-path": try pairPathCommand(arguments)
         case "certs": try certsCommand(arguments)
         case "cert-hash": try certHashCommand(arguments)
+        case "cert-url": try certURLCommand(arguments)
         case "entitlements": try entitlementsCommand(arguments)
         default: throw HelperError("unknown command \(command)\n\(usageText)")
         }

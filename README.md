@@ -32,10 +32,16 @@ No path → interactive menu (install / certificate / pairing). Drag & drop the 
 
 - `sidex <app.ipa> [--keep-watch]` — install/refresh
 - `sidex pair [--to NAME|BUNDLE] [--out FILE] [--save-only]` — pairing file
-- `sidex cert [--password PW] [--out FILE] [--push-to NAME|BUNDLE]` — dev identity `.p12`
+- `sidex cert [--password PW] [--out FILE] [--push-to NAME|BUNDLE] [--import-to NAME|BUNDLE]` — dev identity `.p12`
 - `sidex devices` / `sidex apps` — list
 - `sidex unpair` — forget this Mac
 - `SIDEX_TEAM=XXXXXXXXXX sidex …` — skip Team ID detection
+
+## LiveContainer
+
+sidex hands the signing certificate to LiveContainer through its URL scheme — no password typing, no file picking (`sidex cert --import-to LiveContainer` refreshes the certificate alone).
+
+**App Group / share sheet:** not available through Xcode yet. `xcodebuild` can enable the App Groups capability on an App ID but cannot create or link the group itself (`canRequestFromPortal: false`), so LiveContainer still reports `App Group ID: unknown` and its share sheet stays empty. This is under investigation. Installing and certificate import work as usual.
 
 ## Limits (free Apple ID)
 
