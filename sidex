@@ -341,26 +341,65 @@ cmd_pair() {
   info "Open the app on iPhone — it should pick it up."
 }
 
-export_p12() { # $1=out file $2=password; needs TEAM; prints a message and returns 1 on failure
-  local KC R VD VK SUBJ
+export_p12() { # $1=out file $2=password; needs TEAM; exports only TEAM's identity
+  local KC R VD VK VK2 KCPW SUBJ H F VOK
   rm -f "$1"
   KC="$(security default-keychain 2>/dev/null | tr -d ' "')"
   [ -n "$KC" ] || KC="$HOME/Library/Keychains/login.keychain-db"
-  R="$(security export -k "$KC" -t identities -f pkcs12 -o "$1" -P "$2" 2>&1)" || {
+  VD="$(mktemp -d)"; VK="$VD/filter.keychain-db"; VK2="$VD/check.keychain-db"
+  KCPW="$(openssl rand -hex 8)"
+  R="$(security export -k "$KC" -t identities -f pkcs12 -o "$VD/all.p12" -P "$2" 2>&1)" || {
     echo "$R" | tail -2 >&2
     echo "ERROR: failed to export identities from $KC" >&2
-    return 1
+    rm -rf "$VD"; return 1
   }
-  chmod 600 "$1" 2>/dev/null || true
-  VD="$(mktemp -d)"; VK="$VD/v.keychain-db"; SUBJ=""
-  security create-keychain -p "$(openssl rand -hex 8)" "$VK" >/dev/null \
-    && security import "$1" -k "$VK" -P "$2" -A >/dev/null 2>&1 \
-    && SUBJ="$(security find-certificate -a -p "$VK" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null)"
+  if ! security create-keychain -p "$KCPW" "$VK" >/dev/null \
+    || ! security import "$VD/all.p12" -k "$VK" -P "$2" -A >/dev/null 2>&1; then
+    echo "ERROR: cannot re-import the exported identities" >&2
+    security delete-keychain "$VK" >/dev/null 2>&1; rm -rf "$VD"; return 1
+  fi
+  # LiveContainer/zsign take the first identity in the .p12, and the login keychain
+  # can hold other teams plus self-signed leftovers: drop every cert that is not
+  # an Apple Development cert for TEAM.
+  mkdir -p "$VD/certs"
+  security find-certificate -a -p "$VK" 2>/dev/null > "$VD/certs.pem"
+  awk -v d="$VD/certs" '/BEGIN CERTIFICATE/{n++; f=sprintf("%s/%s.pem", d, n)} f{print > f} /END CERTIFICATE/{f=""}' "$VD/certs.pem"
+  for F in "$VD"/certs/*.pem; do
+    [ -e "$F" ] || continue
+    SUBJ="$(openssl x509 -in "$F" -noout -subject 2>/dev/null)"
+    if printf '%s' "$SUBJ" | grep -q "CN=Apple Development" && printf '%s' "$SUBJ" | grep -q "OU=$TEAM"; then
+      continue
+    fi
+    H="$(openssl x509 -in "$F" -noout -fingerprint -sha1 2>/dev/null | sed 's/.*=//; s/://g')"
+    [ -n "$H" ] && security delete-certificate -Z "$H" "$VK" >/dev/null 2>&1
+  done
+  if ! security export -k "$VK" -t identities -f pkcs12 -o "$1" -P "$2" >/dev/null 2>&1; then
+    rm -f "$1"
+    echo "ERROR: failed to export the team $TEAM identity" >&2
+    security delete-keychain "$VK" >/dev/null 2>&1; rm -rf "$VD"; return 1
+  fi
   security delete-keychain "$VK" >/dev/null 2>&1
+  chmod 600 "$1" 2>/dev/null || true
+  SUBJ=""; VOK=0
+  if security create-keychain -p "$KCPW" "$VK2" >/dev/null \
+    && security import "$1" -k "$VK2" -P "$2" -A >/dev/null 2>&1; then
+    security find-identity -v -p codesigning "$VK2" 2>/dev/null | grep -q "Apple Development" && VOK=1
+    security find-certificate -a -p "$VK2" 2>/dev/null > "$VD/check.pem"
+    SUBJ="$(openssl crl2pkcs7 -nocrl -certfile "$VD/check.pem" 2>/dev/null \
+      | openssl pkcs7 -print_certs -noout 2>/dev/null | grep '^subject=')"
+  fi
+  security delete-keychain "$VK2" >/dev/null 2>&1
   rm -rf "$VD"
-  [ -n "$SUBJ" ] || { echo "ERROR: exported .p12 failed verification (bad .p12)" >&2; return 1; }
-  echo "$SUBJ" | grep -q "OU=$TEAM" \
-    || { echo "ERROR: exported .p12 is not for team $TEAM: $SUBJ" >&2; return 1; }
+  if [ -z "$SUBJ" ] || [ "$VOK" != 1 ]; then
+    rm -f "$1"
+    echo "ERROR: exported .p12 failed verification (cert or key missing)" >&2
+    return 1
+  fi
+  if printf '%s\n' "$SUBJ" | grep -qv "OU=$TEAM"; then
+    rm -f "$1"
+    echo "ERROR: exported .p12 is not only for team $TEAM: $SUBJ" >&2
+    return 1
+  fi
 }
 
 import_cert() { # $1=bundle $2=p12 $3=password; needs UDID
@@ -373,7 +412,7 @@ import_cert() { # $1=bundle $2=p12 $3=password; needs UDID
 }
 
 cmd_cert() {
-  local PW="" OUT="" PUSH_TO="" IMPORT_TO="" BUNDLE="" NCERTS
+  local PW="" OUT="" PUSH_TO="" IMPORT_TO="" BUNDLE=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --password) PW="${2:-}"; shift 2 ;;
@@ -392,8 +431,6 @@ cmd_cert() {
   [ -n "$OUT" ] || OUT="$PWD/AppleDevelopment-$TEAM.p12"
   [ -n "$PW" ] || PW="$(openssl rand -hex 6)"
   export_p12 "$OUT" "$PW" || fail "Certificate export failed"
-  NCERTS="$(security find-identity -v -p codesigning 2>/dev/null | grep -c "Apple Development" || true)"
-  [ "${NCERTS:-1}" -gt 1 ] 2>/dev/null && info "Note: $NCERTS dev identities exported. Split the .p12 if LiveContainer picks the wrong one."
   info "Certificate file: $OUT"
   info "Password: $PW  (only needed for a manual import)"
   if [ -n "$PUSH_TO" ] || [ -n "$IMPORT_TO" ]; then
